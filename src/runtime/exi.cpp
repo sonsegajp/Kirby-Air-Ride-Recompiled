@@ -41,6 +41,42 @@ struct Device {
 };
 
 // ---- memory card ----
+// An empty card as the SDK's CARDFormat leaves it on this console (flash ID all zero, format time 0;
+// tools/mkcard.py does the same with saves in it): the ID block, then directory and block table,
+// two copies each, the one with the higher check code current.
+void formatCard(std::vector<u8>& card, u32 mbit) {
+    constexpr u32 kBlock = 0x2000;
+    const u32 nblocks = u32(card.size() / kBlock);
+    std::fill(card.begin(), card.end(), u8(0xFF));
+    auto put16 = [&](size_t o, u32 v) { card[o] = u8(v >> 8), card[o + 1] = u8(v); };
+    auto checksum = [&](size_t o, size_t n, size_t at) {
+        u32 s = 0, si = 0;
+        for (size_t i = 0; i < n; i += 2) {
+            const u32 w = u32(card[o + i]) << 8 | card[o + i + 1];
+            s = (s + w) & 0xFFFF, si = (si + (~w & 0xFFFF)) & 0xFFFF;
+        }
+        put16(at, s == 0xFFFF ? 0 : s), put16(at + 2, si == 0xFFFF ? 0 : si);
+    };
+    // ID block: the serial (from the flash ID and the format time), the card's size
+    s64 rand = 0;
+    for (int i = 0; i < 12; i++) {
+        rand = s64(u64(rand) * 1103515245ull + 12345ull) >> 16;
+        card[size_t(i)] = u8(rand & 0xFF);
+        rand = (s64(u64(rand) * 1103515245ull + 12345ull) >> 16) & 0x7FFF;
+    }
+    std::memset(&card[12], 0, 20);  // format time, SRAM bias, language, VI DTV status
+    put16(0x20, 0), put16(0x22, mbit), put16(0x24, 0);  // device id, size in Mbit, encoding (ANSI)
+    checksum(0, 0x1FC, 0x1FC);
+    for (u32 copy = 0; copy < 2; copy++) {
+        const size_t dir = size_t(1 + copy) * kBlock, bat = size_t(3 + copy) * kBlock;
+        put16(dir + 0x1FFA, copy);  // check code
+        checksum(dir, 0x1FFC, dir + 0x1FFC);
+        std::memset(&card[bat], 0, kBlock);
+        put16(bat + 4, copy), put16(bat + 6, nblocks - 5), put16(bat + 8, 4);  // check code, free blocks, last block used
+        checksum(bat + 4, kBlock - 4, bat);
+    }
+}
+
 struct MemoryCard : Device {
     std::FILE* file = nullptr;
     std::vector<u8> image;
@@ -59,7 +95,8 @@ struct MemoryCard : Device {
         } else {
             std::error_code ec;  // (its folder too: a first run has no saves/ yet)
             if (const auto dir = std::filesystem::path(path).parent_path(); !dir.empty()) std::filesystem::create_directories(dir, ec);
-            file = std::fopen(path.c_str(), "w+b");  // a new, unformatted card: the game offers to format it
+            formatCard(image, mbit);  // a new card, formatted already (unformatted, the game's first screen asks to format it)
+            file = std::fopen(path.c_str(), "w+b");
             if (file) std::fwrite(image.data(), 1, image.size(), file);
         }
         if (file) std::fflush(file);
