@@ -1,0 +1,75 @@
+diff --git a/include/aurora/imgui.h b/include/aurora/imgui.h
+index 77eba9a..a55acf9 100644
+--- a/include/aurora/imgui.h
++++ b/include/aurora/imgui.h
+@@ -12,6 +12,8 @@ extern "C" {
+ #endif
+ 
+ ImTextureID aurora_imgui_add_texture(uint32_t width, uint32_t height, const void* rgba8);
++// Replaces the texels of a texture made by aurora_imgui_add_texture (same size).
++void aurora_imgui_update_texture(ImTextureID texture, uint32_t width, uint32_t height, const void* rgba8);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/lib/imgui.cpp b/lib/imgui.cpp
+index 77f65fd..64434a4 100644
+--- a/lib/imgui.cpp
++++ b/lib/imgui.cpp
+@@ -33,6 +33,7 @@ bool g_useSdlRenderer = false;
+ 
+ std::vector<SDL_Texture*> g_sdlTextures;
+ std::vector<wgpu::Texture> g_wgpuTextures;
++std::vector<std::pair<ImTextureID, wgpu::Texture>> g_wgpuTextureOf; // (for updates)
+ 
+ wgpu::Buffer create_texture_upload_buffer(uint32_t width, uint32_t height, const uint8_t* data,
+                                           uint32_t copyBytesPerRow) {
+@@ -168,6 +169,7 @@ void shutdown() noexcept {
+   }
+   g_sdlTextures.clear();
+   g_wgpuTextures.clear();
++  g_wgpuTextureOf.clear();
+ }
+ 
+ void set_cursor_managed(bool managed) noexcept {
+@@ -324,7 +326,32 @@ ImTextureID add_texture(uint32_t width, uint32_t height, const uint8_t* data) no
+                            size);
+   }
+   g_wgpuTextures.push_back(texture);
+-  return reinterpret_cast<ImTextureID>(textureView.MoveToCHandle());
++  const auto id = reinterpret_cast<ImTextureID>(textureView.MoveToCHandle());
++  g_wgpuTextureOf.emplace_back(id, texture);
++  return id;
++}
++
++void update_texture(ImTextureID id, uint32_t width, uint32_t height, const uint8_t* data) noexcept {
++  if (window::get_sdl_renderer()) {
++    SDL_UpdateTexture(reinterpret_cast<SDL_Texture*>(id), nullptr, data, width * 4);
++    return;
++  }
++  for (const auto& [view, texture] : g_wgpuTextureOf) {
++    if (view != id) {
++      continue;
++    }
++    const wgpu::TexelCopyTextureInfo dstView{
++        .texture = texture,
++    };
++    const uint32_t copyBytesPerRow = AURORA_ALIGN(width * 4, 256);
++    const wgpu::TexelCopyBufferLayout dataLayout{
++        .bytesPerRow = copyBytesPerRow,
++        .rowsPerImage = height,
++    };
++    enqueue_texture_upload(create_texture_upload_buffer(width, height, data, copyBytesPerRow), dstView, dataLayout,
++                           {.width = width, .height = height, .depthOrArrayLayers = 1});
++    return;
++  }
+ }
+ } // namespace aurora::imgui
+ 
+@@ -333,4 +360,7 @@ extern "C" {
+ ImTextureID aurora_imgui_add_texture(uint32_t width, uint32_t height, const void* rgba8) {
+   return aurora::imgui::add_texture(width, height, static_cast<const uint8_t*>(rgba8));
+ }
++void aurora_imgui_update_texture(ImTextureID texture, uint32_t width, uint32_t height, const void* rgba8) {
++  aurora::imgui::update_texture(texture, width, height, static_cast<const uint8_t*>(rgba8));
++}
+ }

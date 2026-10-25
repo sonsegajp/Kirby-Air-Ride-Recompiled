@@ -1,0 +1,441 @@
+diff --git a/lib/gfx/pipeline_cache.cpp b/lib/gfx/pipeline_cache.cpp
+index 46a9903..fe493cd 100644
+--- a/lib/gfx/pipeline_cache.cpp
++++ b/lib/gfx/pipeline_cache.cpp
+@@ -26,6 +26,15 @@
+ #include <thread>
+ 
+ #include <SDL3/SDL_iostream.h>
++#if defined(_WIN32)
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#else
++#include <csignal>
++#include <unistd.h>
++#endif
+ #include <absl/container/flat_hash_map.h>
+ #include <absl/container/flat_hash_set.h>
+ #include <fmt/format.h>
+@@ -1136,7 +1145,83 @@ void rebuild_pipeline_cache() {
+   }
+ }
+ 
++// A session's mark on the pipeline cache (patches/aurora): made at start, removed at a clean exit
++// (aurora_pipeline_cache_clean_exit). Found at start, the last session crashed - perhaps building a pipeline the cache
++// had just recorded, which every later start would build again first and crash on as well (Kirby Air Ride: a draw
++// from a stream gone out of step) - so the cache is dropped and starts over.
++static unsigned long current_pid() {
++#if defined(_WIN32)
++  return GetCurrentProcessId();
++#else
++  return static_cast<unsigned long>(getpid());
++#endif
++}
++
++static std::filesystem::path pipeline_cache_mark() {
++  return io::fs_path_from_string(g_config.cachePath) / "pipeline_cache.in_use";
++}
++
++// The process that made a mark, if it is still running (a second copy of the game shares the cache).
++static bool mark_owner_running(const std::filesystem::path& mark) {
++  unsigned long pid = 0;
++  if (SDL_IOStream* f = SDL_IOFromFile(io::fs_path_to_string(mark).c_str(), "rb")) {
++    char buf[32] = {};
++    SDL_ReadIO(f, buf, sizeof buf - 1);
++    SDL_CloseIO(f);
++    pid = std::strtoul(buf[0] == 'o' && buf[1] == 'k' ? buf + 3 : buf, nullptr, 10);
++  }
++  if (pid == 0 || pid == static_cast<unsigned long>(current_pid())) {
++    return false;
++  }
++#if defined(_WIN32)
++  const HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
++  if (h == nullptr) {
++    return false;
++  }
++  DWORD code = 0;
++  const bool running = GetExitCodeProcess(h, &code) && code == STILL_ACTIVE;
++  CloseHandle(h);
++  return running;
++#else
++  return kill(static_cast<pid_t>(pid), 0) == 0;
++#endif
++}
++
++static void check_pipeline_cache_mark() {
++  std::error_code ec;
++  const auto mark = pipeline_cache_mark();
++  if (std::filesystem::exists(mark, ec) && mark_owner_running(mark)) {
++    return;  // another copy is running: its mark stays
++  }
++  // Only a session that died in its first seconds (before aurora_pipeline_cache_session_ok marked it "ok") drops the
++  // cache: a pipeline the cache recorded that crashes as it is built crashes every start, at once. A session closed
++  // any other way (killed, crashed later) keeps the cache - starting over makes every level draw dark and slow for a
++  // while as its pipelines are built again.
++  bool healthy = false;
++  if (SDL_IOStream* f = SDL_IOFromFile(io::fs_path_to_string(mark).c_str(), "rb")) {
++    char buf[4] = {};
++    SDL_ReadIO(f, buf, 2);
++    SDL_CloseIO(f);
++    healthy = buf[0] == 'o' && buf[1] == 'k';
++  }
++  if (std::filesystem::exists(mark, ec) && healthy) {
++    Log.info("The last session did not exit cleanly (after it ran fine): the pipeline cache is kept");
++  } else if (std::filesystem::exists(mark, ec)) {
++    Log.warn("The last session ended in its first seconds: the pipeline cache starts over");
++    const auto dir = io::fs_path_from_string(g_config.cachePath);
++    for (const char* name : {"pipeline_cache.db", "pipeline_cache.db-wal", "pipeline_cache.db-shm"}) {
++      std::filesystem::remove(dir / name, ec);
++    }
++  }
++  if (SDL_IOStream* f = SDL_IOFromFile(io::fs_path_to_string(mark).c_str(), "wb")) {
++    const auto pid = std::to_string(current_pid());
++    SDL_WriteIO(f, pid.data(), pid.size());
++    SDL_CloseIO(f);
++  }
++}
++
+ void initialize_pipeline_cache() {
++  check_pipeline_cache_mark();
+   g_pipelineCacheBroken = false;
+   g_pipelineCacheWriterStop = false;
+   g_pipelineThreadEnd = false;
+@@ -1211,3 +1296,23 @@ bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline) {
+ }
+ 
+ } // namespace aurora::gfx
++
++// The host is exiting cleanly (it may leave without Aurora's shutdown): the pipeline cache is good.
++// The host: this session has run long enough (its start did not crash): the mark says so.
++extern "C" void aurora_pipeline_cache_session_ok() {
++  const auto mark = aurora::gfx::pipeline_cache_mark();
++  if (SDL_IOStream* f = SDL_IOFromFile(aurora::io::fs_path_to_string(mark).c_str(), "wb")) {
++    const auto text = "ok " + std::to_string(aurora::gfx::current_pid());
++    SDL_WriteIO(f, text.data(), text.size());
++    SDL_CloseIO(f);
++  }
++}
++
++extern "C" void aurora_pipeline_cache_clean_exit() {
++  const auto mark = aurora::gfx::pipeline_cache_mark();
++  if (aurora::gfx::mark_owner_running(mark)) {
++    return;  // (another copy's)
++  }
++  std::error_code ec;
++  std::filesystem::remove(mark, ec);
++}
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index e6c10ec..04f7a63 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -19,66 +19,60 @@
+ #include <span>
+ #include <vector>
+ 
++#include <absl/container/flat_hash_map.h>
++
+ namespace aurora::gx::fifo {
++// (array_range, below)
++static absl::flat_hash_map<std::pair<const void*, u32>, gfx::Range> sArrayRanges;
+ namespace {
+ constexpr Module Log{"aurora::gx::fifo"};
+ 
+ u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) noexcept {
++  // (written in place: appending index by index cost more than the rest of a merged draw - patches/aurora)
+   u16 numIndices = 0;
+   if (prim == GX_QUADS) {
+-    buf.reserve_extra((vtxCount / 4) * 6 * sizeof(u16));
+-
+-    for (u16 v = 0; v < vtxCount; v += 4) {
+-      u16 idx0 = vtxStart + v;
+-      u16 idx1 = vtxStart + v + 1;
+-      u16 idx2 = vtxStart + v + 2;
+-      u16 idx3 = vtxStart + v + 3;
+-
+-      buf.append(idx0);
+-      buf.append(idx1);
+-      buf.append(idx2);
+-      numIndices += 3;
+-
+-      buf.append(idx2);
+-      buf.append(idx3);
+-      buf.append(idx0);
+-      numIndices += 3;
+-    }
++    const u32 quads = (static_cast<u32>(vtxCount) + 3) / 4;
++    auto* out = reinterpret_cast<u16*>(buf.extend(quads * 6 * sizeof(u16)));
++    for (u32 q = 0; q < quads; ++q, out += 6) {
++      const u16 i0 = static_cast<u16>(vtxStart + q * 4);
++      out[0] = i0;
++      out[1] = static_cast<u16>(i0 + 1);
++      out[2] = static_cast<u16>(i0 + 2);
++      out[3] = static_cast<u16>(i0 + 2);
++      out[4] = static_cast<u16>(i0 + 3);
++      out[5] = i0;
++    }
++    numIndices = static_cast<u16>(quads * 6);
+   } else if (prim == GX_TRIANGLES) {
+-    buf.reserve_extra(vtxCount * sizeof(u16));
++    auto* out = reinterpret_cast<u16*>(buf.extend(vtxCount * sizeof(u16)));
+     for (u16 v = 0; v < vtxCount; ++v) {
+-      const u16 idx = vtxStart + v;
+-      buf.append(idx);
+-      ++numIndices;
+-    }
+-  } else if (prim == GX_TRIANGLEFAN) {
+-    buf.reserve_extra(((u32(vtxCount) - 3) * 3 + 3) * sizeof(u16));
+-    for (u16 v = 0; v < vtxCount; ++v) {
+-      const u16 idx = vtxStart + v;
+-      if (v < 3) {
+-        buf.append(idx);
+-        ++numIndices;
+-        continue;
++      out[v] = static_cast<u16>(vtxStart + v);
++    }
++    numIndices = vtxCount;
++  } else if (prim == GX_TRIANGLEFAN || prim == GX_TRIANGLESTRIP) {
++    const u32 head = std::min<u32>(vtxCount, 3);
++    const u32 count = head + (vtxCount > 3 ? (static_cast<u32>(vtxCount) - 3) * 3 : 0);
++    auto* out = reinterpret_cast<u16*>(buf.extend(count * sizeof(u16)));
++    for (u32 v = 0; v < head; ++v) {
++      *out++ = static_cast<u16>(vtxStart + v);
++    }
++    if (prim == GX_TRIANGLEFAN) {
++      for (u32 v = 3; v < vtxCount; ++v, out += 3) {
++        const u16 idx = static_cast<u16>(vtxStart + v);
++        out[0] = vtxStart;
++        out[1] = static_cast<u16>(idx - 1);
++        out[2] = idx;
+       }
+-      buf.append(std::array{vtxStart, static_cast<u16>(idx - 1), idx});
+-      numIndices += 3;
+-    }
+-  } else if (prim == GX_TRIANGLESTRIP) {
+-    buf.reserve_extra(((static_cast<u32>(vtxCount) - 3) * 3 + 3) * sizeof(u16));
+-    for (u16 v = 0; v < vtxCount; ++v) {
+-      const u16 idx = vtxStart + v;
+-      if (v < 3) {
+-        buf.append(idx);
+-        ++numIndices;
+-        continue;
+-      }
+-      if ((v & 1) == 0) {
+-        buf.append(std::array{static_cast<u16>(idx - 2), static_cast<u16>(idx - 1), idx});
+-      } else {
+-        buf.append(std::array{static_cast<u16>(idx - 1), static_cast<u16>(idx - 2), idx});
++    } else {
++      for (u32 v = 3; v < vtxCount; ++v, out += 3) {
++        const u16 idx = static_cast<u16>(vtxStart + v);
++        const bool even = (v & 1) == 0;
++        out[0] = static_cast<u16>(even ? idx - 2 : idx - 1);
++        out[1] = static_cast<u16>(even ? idx - 1 : idx - 2);
++        out[2] = idx;
+       }
+-      numIndices += 3;
+     }
++    numIndices = static_cast<u16>(count);
+   } else if (prim == GX_LINES || prim == GX_LINESTRIP || prim == GX_POINTS) {
+     buf.reserve_extra(6 * sizeof(u16));
+     buf.append<u16>(0);
+@@ -286,6 +280,7 @@ ProcessResult process(const u8* data, u32 size) noexcept {
+       for (auto& array : g_gxState.arrays) {
+         array.cachedRange = {};
+       }
++      sArrayRanges.clear();
+       g_gxState.dirty |= DirtyImmediates;
+       break;
+     }
+@@ -379,6 +374,22 @@ static u32 calc_vtx_size(GXVtxFmt fmt) noexcept {
+   return vtxSize;
+ }
+ 
++// Arrays copied to this frame's storage, by their data and size: the host sends a slot the same snapshot again when
++// a draw returns to it (patches/aurora), and that need not be copied again.
++static uint32_t sArrayRangesFrame = UINT32_MAX;
++
++static gfx::Range array_range(const void* data, u32 size) noexcept {
++  if (const uint32_t frame = gfx::current_frame(); frame != sArrayRangesFrame) {
++    sArrayRangesFrame = frame;
++    sArrayRanges.clear();
++  }
++  const auto [it, fresh] = sArrayRanges.try_emplace(std::pair{data, size});
++  if (fresh || it->second.size == 0) {
++    it->second = gfx::push_storage(static_cast<const uint8_t*>(data), size);
++  }
++  return it->second;
++}
++
+ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Range vertRange, gfx::Range idxRange,
+                          u32 numIndices) noexcept {
+   auto& state = g_gxState;
+@@ -391,7 +402,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+     }
+     auto& array = state.arrays[i];
+     if (array.cachedRange.size == 0) {
+-      array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
++      array.cachedRange = array_range(array.data, array.size);
+     }
+     immediates.arrayStart[i - GX_VA_POS] = array.cachedRange.offset;
+   }
+diff --git a/lib/gx/regs.cpp b/lib/gx/regs.cpp
+index ea23130..e9b1630 100644
+--- a/lib/gx/regs.cpp
++++ b/lib/gx/regs.cpp
+@@ -279,7 +279,8 @@ void bp_clear_depth(u8, u32 value) noexcept { g_gxState.clearDepth = reg_get(val
+ void bp_efb_copy(u8, u32 value) noexcept {
+   const bool clear = reg_get(value, 1, 11) != 0;
+   if (reg_get(value, 1, 14) != 0) {
+-    Log.warn("STUB: display copy is not implemented");
++    // A display copy (the EFB to the external frame buffer): nothing to do, the frame is presented directly. (It warned
++    // here every frame: a log line per drawn frame on the render thread.)
+   } else {
+     copy_tex(g_gxState.texCopyDest, clear);
+   }
+diff --git a/lib/gx/shader.cpp b/lib/gx/shader.cpp
+index 2d10095..1ce0aa1 100644
+--- a/lib/gx/shader.cpp
++++ b/lib/gx/shader.cpp
+@@ -1213,8 +1213,17 @@ std::string build_shader_source(const ShaderConfig& config, DstAlphaMode dstAlph
+       vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, nbt_slice_local(NbtSlice::B));
+     } else if (tcg.src == GX_TG_TANGENT) {
+       vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f({}, 1.0);", i, nbt_slice_local(NbtSlice::T));
+-    } else
+-      UNLIKELY FATAL("unhandled tcg src {}", underlying(tcg.src));
++    } else {
++      // No texgen makes this coordinate (a stage still set from an earlier draw: undefined on console, where it draws
++      // on regardless). It reads as zero; failing here also left the config in the pipeline cache, to fail every launch
++      // after (Kirby Air Ride - patches/aurora).
++      static bool warned = false;
++      if (!warned) {
++        warned = true;
++        Log.warn("texcoord {} has no texgen (src {}): read as zero", i, underlying(tcg.src));
++      }
++      vtxXfrAttrs += fmt::format("\n    var tc{} = vec4f(0.0, 0.0, 1.0, 1.0);", i);
++    }
+     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
+       if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+         vtxXfrAttrs += fmt::format("\n    var tc{0}_tmp = tc{0} * ubuf.postex_mtx[in_texmtxidx{0} / 3u];", i);
+diff --git a/lib/gx/shader_info.cpp b/lib/gx/shader_info.cpp
+index 9ba1779..febb573 100644
+--- a/lib/gx/shader_info.cpp
++++ b/lib/gx/shader_info.cpp
+@@ -426,9 +426,15 @@ void validate_shader_config(const ShaderConfig& config, const ShaderInfo& info,
+     }
+     const auto& tcg = config.tcgs[i];
+     if (tcg.src == GX_MAX_TEXGENSRC && !(tcg.type >= GX_TG_BUMP0 && tcg.type <= GX_TG_BUMP7)) {
+-      UNLIKELY FATAL("GX: a stage reads texcoord {}, but no texgen makes it (undefined on console). Usually a "
+-                     "TEV or indirect stage is still set from an earlier draw.\n{}",
+-                     i, describe_texturing(config, numTexGens));
++      // (undefined on console, which draws on: the shader reads it as zero - patches/aurora)
++      static bool warned = false;
++      if (!warned) {
++        warned = true;
++        Log.warn("GX: a stage reads texcoord {}, but no texgen makes it (undefined on console). Usually a "
++                       "TEV or indirect stage is still set from an earlier draw.\n{}",
++                       i, describe_texturing(config, numTexGens));
++      }
++      continue;
+     }
+     if (tcg.src >= GX_TG_TEX0 && tcg.src <= GX_TG_TEX7) {
+       const auto attr = static_cast<GXAttr>(GX_VA_TEX0 + (tcg.src - GX_TG_TEX0));
+diff --git a/lib/gx/texture.cpp b/lib/gx/texture.cpp
+index 33a8c99..701315b 100644
+--- a/lib/gx/texture.cpp
++++ b/lib/gx/texture.cpp
+@@ -267,7 +267,7 @@ struct TextureKeys {
+   std::optional<aurora::texture::TextureSourceKey> sourceKey;
+ };
+ 
+-TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bool buildSourceKey) {
++TextureKeys hash_texture_source_uncached(const GXTexObj_& obj, const GXTlutObj_* tlut, bool buildSourceKey) {
+   ZoneScoped;
+   const size_t textureBytes = texture::texture_source_size(obj.format(), obj.width(), obj.height(), obj.mip_count());
+   CHECK(obj.has_data() && textureBytes != 0, "invalid texture source for content hash");
+@@ -359,6 +359,57 @@ TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bo
+   return keys;
+ }
+ 
++// Content hashes of textures without an object id (a raw GX stream's: every load is by address), kept for one game
++// frame: the renderer draws several in-between frames from each, all loading the same textures, and hashing every
++// texture's bytes again each time cost milliseconds a frame in busy scenes. The host starts a new memo with each game
++// frame (aurora_texture_memo_reset); until then a texture at the same address, size, format and palette is the same.
++struct HashMemoKey {
++  const void* data;
++  const void* tlut;
++  u32 width, height, format, mips;
++  u32 tlutFormat, tlutEntries;
++  bool sourceKey;
++  bool operator==(const HashMemoKey&) const = default;
++  template <typename H>
++  friend H AbslHashValue(H h, const HashMemoKey& k) {
++    return H::combine(std::move(h), k.data, k.tlut, k.width, k.height, k.format, k.mips, k.tlutFormat, k.tlutEntries,
++                      k.sourceKey);
++  }
++};
++absl::flat_hash_map<HashMemoKey, TextureKeys> s_hashMemo;
++std::atomic<uint32_t> s_hashMemoGeneration{0};
++uint32_t s_hashMemoSeen = 0;
++
++TextureKeys hash_texture_source(const GXTexObj_& obj, const GXTlutObj_* tlut, bool buildSourceKey) {
++  if (obj.texObjId != 0) {
++    return hash_texture_source_uncached(obj, tlut, buildSourceKey);
++  }
++  if (const uint32_t gen = s_hashMemoGeneration.load(std::memory_order_acquire); gen != s_hashMemoSeen) {
++    s_hashMemoSeen = gen;
++    s_hashMemo.clear();
++  }
++  const HashMemoKey key{
++      .data = obj.data,
++      .tlut = tlut != nullptr ? tlut->data : nullptr,
++      .width = obj.width(),
++      .height = obj.height(),
++      .format = static_cast<u32>(obj.format()),
++      .mips = obj.mip_count(),
++      .tlutFormat = tlut != nullptr ? static_cast<u32>(tlut->format) : 0u,
++      .tlutEntries = tlut != nullptr ? static_cast<u32>(tlut->numEntries) : 0u,
++      .sourceKey = buildSourceKey,
++  };
++  if (const auto it = s_hashMemo.find(key); it != s_hashMemo.end()) {
++    return it->second;
++  }
++  TextureKeys keys = hash_texture_source_uncached(obj, tlut, buildSourceKey);
++  if (s_hashMemo.size() >= 16384) {
++    s_hashMemo.clear();
++  }
++  s_hashMemo.emplace(key, keys);
++  return keys;
++}
++
+ gfx::TextureHandle get_tlut_texture(const GXTlutObj_& tlut) {
+   if (tlut.tlutObjId != 0) {
+     auto& cache = s_tlutObjectCaches[tlut.tlutObjId];
+@@ -864,3 +915,8 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
+   }
+ }
+ } // namespace aurora::gx
++
++// The host: a new game frame (texture content may have changed since).
++extern "C" void aurora_texture_memo_reset() {
++  aurora::gx::s_hashMemoGeneration.fetch_add(1, std::memory_order_release);
++}
+diff --git a/lib/internal.hpp b/lib/internal.hpp
+index 9e6939a..34d6a86 100644
+--- a/lib/internal.hpp
++++ b/lib/internal.hpp
+@@ -313,6 +313,14 @@ public:
+     m_owned = true;
+   }
+ 
++  // Grows by `size` bytes (not cleared) and returns where they start, to be written in place.
++  uint8_t* extend(size_t size) {
++    resize(m_length + size, false);
++    uint8_t* at = m_data + m_length;
++    m_length += size;
++    return at;
++  }
++
+   void clear() { m_length = 0; }
+   void reserve_extra(size_t size) { resize(m_length + size, true); }
+ 

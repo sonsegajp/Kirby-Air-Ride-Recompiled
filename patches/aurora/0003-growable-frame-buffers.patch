@@ -1,0 +1,500 @@
+diff --git a/lib/gfx/encoding.cpp b/lib/gfx/encoding.cpp
+index ad53429..c653541 100644
+--- a/lib/gfx/encoding.cpp
++++ b/lib/gfx/encoding.cpp
+@@ -330,12 +330,6 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
+   }
+ }
+ 
+-constexpr uint64_t VertexStagingOffset = 0;
+-constexpr uint64_t UniformStagingOffset = VertexStagingOffset + VertexBufferSize;
+-constexpr uint64_t IndexStagingOffset = UniformStagingOffset + UniformBufferSize;
+-constexpr uint64_t StorageStagingOffset = IndexStagingOffset + IndexBufferSize;
+-constexpr uint64_t TextureUploadStagingOffset = StorageStagingOffset + StorageBufferSize;
+-
+ constexpr uint32_t align_down_copy_offset(uint32_t value) noexcept { return value & ~3u; }
+ 
+ void copy_staging_buffer_range(wgpu::CommandEncoder& cmd, const FramePacket& frame, uint32_t& copied,
+@@ -369,11 +363,12 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
+   const webgpu::gpu_prof::Zone zone{cmd, "Staging copies"};
+   const auto& highWater = op.highWater;
+   auto& res = resources();
+-  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, res.vertexBuffer);
+-  copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
++  const auto layout = staging_layout();
++  copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, layout.verts, res.vertexBuffer);
++  copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, layout.uniforms,
+                             res.uniformBuffer);
+-  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, IndexStagingOffset, res.indexBuffer);
+-  copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, StorageStagingOffset,
++  copy_staging_buffer_range(cmd, frame, frame.copied.indices, highWater.indices, layout.indices, res.indexBuffer);
++  copy_staging_buffer_range(cmd, frame, frame.copied.storage, highWater.storage, layout.storage,
+                             res.storageBuffer);
+ 
+   if constexpr (UseTextureBuffer) {
+@@ -382,7 +377,7 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
+       const wgpu::TexelCopyBufferInfo buf{
+           .layout =
+               wgpu::TexelCopyBufferLayout{
+-                  .offset = item.buffer ? item.layout.offset : item.layout.offset + TextureUploadStagingOffset,
++                  .offset = item.buffer ? item.layout.offset : item.layout.offset + layout.textureUpload,
+                   .bytesPerRow = AURORA_ALIGN(item.layout.bytesPerRow, 256),
+                   .rowsPerImage = item.layout.rowsPerImage,
+               },
+diff --git a/lib/gfx/frame.cpp b/lib/gfx/frame.cpp
+index 2d6d5e2..a2c4861 100644
+--- a/lib/gfx/frame.cpp
++++ b/lib/gfx/frame.cpp
+@@ -15,6 +15,7 @@
+ #include "../webgpu/gpu.hpp"
+ #include "../webgpu/gpu_prof.hpp"
+ 
++#include <algorithm>
+ #include <array>
+ #include <atomic>
+ #include <chrono>
+@@ -221,7 +222,7 @@ void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
+   }
+ 
+   g_stagingBuffers[slot].MapAsync(
+-      wgpu::MapMode::Write, 0, StagingBufferSize, wgpu::CallbackMode::AllowSpontaneous,
++      wgpu::MapMode::Write, 0, staging_layout().size, wgpu::CallbackMode::AllowSpontaneous,
+       [slot, releaseSlotOnCompletion](wgpu::MapAsyncStatus status, wgpu::StringView message) {
+         if (status == wgpu::MapAsyncStatus::CallbackCancelled || status == wgpu::MapAsyncStatus::Aborted) {
+           Log.warn("Buffer mapping {}: {}", magic_enum::enum_name(status), message);
+@@ -239,6 +240,117 @@ void map_staging_buffer(size_t slot, bool releaseSlotOnCompletion = false) {
+         }
+       });
+ }
++
++// ---- growable frame buffers ----
++// Sizes a frame asked for but did not get (0 = no request).
++std::atomic<uint64_t> g_growVerts{0};
++std::atomic<uint64_t> g_growIndices{0};
++std::atomic<uint64_t> g_growStorage{0};
++
++void create_buffer(wgpu::Buffer& out, wgpu::BufferUsage usage, uint64_t size, const char* label) {
++  const wgpu::BufferDescriptor descriptor{
++      .label = label,
++      .usage = usage,
++      .size = size,
++  };
++  out = g_device.CreateBuffer(&descriptor);
++}
++
++// The vertex, index and storage buffers at their current sizes, and the staging buffers feeding them.
++void create_frame_buffers() {
++  create_buffer(g_resources.vertexBuffer,
++                wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
++                g_resources.vertexBufferSize, "Shared Vertex Buffer");
++  create_buffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst,
++                g_resources.indexBufferSize, "Shared Index Buffer");
++  create_buffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
++                g_resources.storageBufferSize, "Shared Storage Buffer");
++  const uint64_t stagingSize = staging_layout().size;
++  for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
++    const auto label = fmt::format("Staging Buffer {}", i);
++    create_buffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, stagingSize,
++                  label.c_str());
++  }
++}
++
++void create_static_bind_group() {
++  const std::array entries{
++      wgpu::BindGroupEntry{
++          .binding = 0,
++          .buffer = g_resources.vertexBuffer,
++      },
++      wgpu::BindGroupEntry{
++          .binding = 1,
++          .buffer = g_resources.storageBuffer,
++      },
++  };
++  const wgpu::BindGroupDescriptor bindGroupDescriptor{
++      .label = "Static bind group",
++      .layout = g_resources.staticBindGroupLayout,
++      .entryCount = entries.size(),
++      .entries = entries.data(),
++  };
++  g_resources.staticBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
++}
++
++uint64_t grown_size(uint64_t current, uint64_t needed) {
++  uint64_t size = current;
++  while (size < needed + needed / 4) {
++    size *= 2;
++  }
++  return size;
++}
++
++bool growth_requested() noexcept {
++  return g_growVerts.load(std::memory_order_acquire) != 0 || g_growIndices.load(std::memory_order_acquire) != 0 ||
++         g_growStorage.load(std::memory_order_acquire) != 0;
++}
++
++// Recreates the frame buffers larger once every frame in flight is done with them.
++void grow_frame_buffers() {
++  ZoneScoped;
++  render_worker::synchronize();
++  // Each submitted frame maps its staging buffer again asynchronously; wait for all of them.
++  for (size_t slot = 0; slot < g_stagingBuffers.size(); ++slot) {
++    while (g_mappingStates[slot].load(std::memory_order_acquire) == BufferMapState::Mapping) {
++      wait_for_gpu_progress(std::chrono::microseconds{100});
++    }
++  }
++  auto& res = g_resources;
++  // Within the device's limits: vertex and storage buffers are also bound as storage, and the
++  // staging buffer holds all of them at once.
++  const uint64_t maxBuffer = res.limits.maxBufferSize;
++  const uint64_t maxStorage = std::min<uint64_t>(maxBuffer, res.limits.maxStorageBufferBindingSize);
++  const auto grow = [&](std::atomic<uint64_t>& request, uint64_t& size, uint64_t limit) {
++    const uint64_t needed = request.exchange(0, std::memory_order_acq_rel);
++    if (needed <= size) {
++      return;
++    }
++    const uint64_t others = staging_layout().size - size;
++    limit = std::min(limit, maxBuffer > others ? maxBuffer - others : 0);
++    const uint64_t newSize = std::min(grown_size(size, needed), limit & ~uint64_t{255});
++    if (newSize <= size) {
++      Log.warn("Frame buffer cannot grow past {} bytes (device limit); oversized frames stay cut short", size);
++      return;
++    }
++    size = newSize;
++  };
++  const uint64_t oldVerts = res.vertexBufferSize, oldIndices = res.indexBufferSize, oldStorage = res.storageBufferSize;
++  grow(g_growVerts, res.vertexBufferSize, maxStorage);
++  grow(g_growIndices, res.indexBufferSize, maxBuffer);
++  grow(g_growStorage, res.storageBufferSize, maxStorage);
++  if (res.vertexBufferSize == oldVerts && res.indexBufferSize == oldIndices && res.storageBufferSize == oldStorage) {
++    return;
++  }
++  Log.warn("Growing frame buffers: vertex {} -> {}, index {} -> {}, storage {} -> {} bytes", oldVerts,
++           res.vertexBufferSize, oldIndices, res.indexBufferSize, oldStorage, res.storageBufferSize);
++  create_frame_buffers();
++  create_static_bind_group();
++  for (size_t slot = 0; slot < g_stagingBuffers.size(); ++slot) {
++    g_mappingStates[slot].store(BufferMapState::Unmapped, std::memory_order_release);
++    map_staging_buffer(slot);
++  }
++}
+ } // namespace
+ 
+ namespace detail {
+@@ -247,6 +359,39 @@ Resources& resources() noexcept { return g_resources; }
+ 
+ const wgpu::Buffer& staging_buffer(size_t slot) { return g_stagingBuffers[slot]; }
+ 
++StagingLayout staging_layout() noexcept {
++  StagingLayout layout{};
++  layout.verts = 0;
++  layout.uniforms = layout.verts + g_resources.vertexBufferSize;
++  layout.indices = layout.uniforms + UniformBufferSize;
++  layout.storage = layout.indices + g_resources.indexBufferSize;
++  layout.textureUpload = layout.storage + g_resources.storageBufferSize;
++  layout.size = layout.textureUpload + (UseTextureBuffer ? TextureUploadSize : 0);
++  return layout;
++}
++
++void request_buffer_growth(FrameBufferKind kind, uint64_t needed) noexcept {
++  const auto raise = [needed](std::atomic<uint64_t>& request) {
++    uint64_t current = request.load(std::memory_order_acquire);
++    while (current < needed && !request.compare_exchange_weak(current, needed, std::memory_order_acq_rel)) {
++    }
++  };
++  switch (kind) {
++  case FrameBufferKind::Vertex:
++    raise(g_growVerts);
++    break;
++  case FrameBufferKind::Index:
++    raise(g_growIndices);
++    break;
++  case FrameBufferKind::Storage:
++    raise(g_growStorage);
++    break;
++  case FrameBufferKind::Uniform:
++    // Uniform bind groups are created against the uniform buffer all over; it keeps its size.
++    break;
++  }
++}
++
+ std::optional<RegisteredDrawType> find_runtime_draw_type(DrawTypeId id) {
+   std::lock_guard lock{g_runtimeTypeMutex};
+   const auto* slot = find_runtime_draw_type_locked(id);
+@@ -406,31 +551,9 @@ void initialize() {
+   // For uniform & storage buffer offset alignments
+   g_device.GetLimits(&g_resources.limits);
+ 
+-  const auto createBuffer = [](wgpu::Buffer& out, wgpu::BufferUsage usage, uint64_t size, const char* label) {
+-    if (size <= 0) {
+-      return;
+-    }
+-    const wgpu::BufferDescriptor descriptor{
+-        .label = label,
+-        .usage = usage,
+-        .size = size,
+-    };
+-    out = g_device.CreateBuffer(&descriptor);
+-  };
+-  createBuffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
+-               "Shared Uniform Buffer");
+-  createBuffer(g_resources.vertexBuffer,
+-               wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst, VertexBufferSize,
+-               "Shared Vertex Buffer");
+-  createBuffer(g_resources.indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, IndexBufferSize,
+-               "Shared Index Buffer");
+-  createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
+-               "Shared Storage Buffer");
+-  for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
+-    const auto label = fmt::format("Staging Buffer {}", i);
+-    createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
+-                 label.c_str());
+-  }
++  create_buffer(g_resources.uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
++                "Shared Uniform Buffer");
++  create_frame_buffers();
+   for (auto& state : g_mappingStates) {
+     state.store(BufferMapState::Unmapped, std::memory_order_release);
+   }
+@@ -465,23 +588,7 @@ void initialize() {
+         .entries = layoutEntries.data(),
+     };
+     g_resources.staticBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
+-    const std::array entries{
+-        wgpu::BindGroupEntry{
+-            .binding = 0,
+-            .buffer = g_resources.vertexBuffer,
+-        },
+-        wgpu::BindGroupEntry{
+-            .binding = 1,
+-            .buffer = g_resources.storageBuffer,
+-        },
+-    };
+-    const wgpu::BindGroupDescriptor bindGroupDescriptor{
+-        .label = "Static bind group",
+-        .layout = g_resources.staticBindGroupLayout,
+-        .entryCount = entries.size(),
+-        .entries = entries.data(),
+-    };
+-    g_resources.staticBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
++    create_static_bind_group();
+   }
+ 
+   {
+@@ -623,6 +730,9 @@ std::optional<size_t> acquire_mapped_staging_buffer() {
+ bool begin_frame() {
+   ZoneScoped;
+   // pace_frame_start();
++  if (growth_requested()) {
++    grow_frame_buffers();
++  }
+   const size_t frameSlot = acquire_frame_slot();
+   const auto stagingSlot = acquire_mapped_staging_buffer();
+   if (!stagingSlot) {
+@@ -644,10 +754,10 @@ bool begin_frame() {
+     buf = ByteBuffer{static_cast<u8*>(stagingBuf.GetMappedRange(bufferOffset, size)), static_cast<size_t>(size)};
+     bufferOffset += size;
+   };
+-  mapBuffer(frame.verts, VertexBufferSize);
++  mapBuffer(frame.verts, g_resources.vertexBufferSize);
+   mapBuffer(frame.uniforms, UniformBufferSize);
+-  mapBuffer(frame.indices, IndexBufferSize);
+-  mapBuffer(frame.storage, StorageBufferSize);
++  mapBuffer(frame.indices, g_resources.indexBufferSize);
++  mapBuffer(frame.storage, g_resources.storageBufferSize);
+   if constexpr (UseTextureBuffer) {
+     mapBuffer(frame.textureUpload, TextureUploadSize);
+   }
+diff --git a/lib/gfx/frame.hpp b/lib/gfx/frame.hpp
+index 9e1152c..0081608 100644
+--- a/lib/gfx/frame.hpp
++++ b/lib/gfx/frame.hpp
+@@ -9,11 +9,19 @@ namespace aurora::gfx::detail {
+ 
+ inline constexpr size_t FrameSlotCount = 2;
+ inline constexpr size_t StagingBufferCount = FrameSlotCount + 3;
+-inline constexpr uint64_t StagingBufferSize = UniformBufferSize + VertexBufferSize + IndexBufferSize +
+-                                              StorageBufferSize + (UseTextureBuffer ? TextureUploadSize : 0);
++// Staging buffer layout: vertices, uniforms, indices, storage, texture uploads.
++struct StagingLayout {
++  uint64_t verts, uniforms, indices, storage, textureUpload, size;
++};
++StagingLayout staging_layout() noexcept;
+ 
+ const wgpu::Buffer& staging_buffer(size_t slot);
+ 
++// A frame ran out of room in one of its buffers: the rest of it is dropped, and the buffer is grown
++// to at least `needed` bytes before the next frame begins.
++enum class FrameBufferKind { Vertex, Uniform, Index, Storage };
++void request_buffer_growth(FrameBufferKind kind, uint64_t needed) noexcept;
++
+ struct RegisteredDrawType {
+   DrawCallback draw = nullptr;
+   void* userdata = nullptr;
+diff --git a/lib/gfx/recording.cpp b/lib/gfx/recording.cpp
+index 190a1f5..2b30572 100644
+--- a/lib/gfx/recording.cpp
++++ b/lib/gfx/recording.cpp
+@@ -38,6 +38,7 @@ using namespace detail;
+ 
+ namespace {
+ constexpr Module Log{"aurora::gfx"};
++bool g_frameOverflowed = false; // this frame ran out of room in a frame buffer; its draws are dropped
+ 
+ struct FrameRecorder {
+   FramePacket* packet = nullptr;
+@@ -284,6 +285,23 @@ void seal_pass(FramePacket& frame, uint32_t passIndex) {
+ }
+ 
+ Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment) {
++  // A frame buffer (mapped staging memory) cannot grow mid-frame: drop the rest of the frame and
++  // have the buffer recreated larger before the next one.
++  const size_t needed = (alignment != 0 ? AURORA_ALIGN(target.size(), alignment) : target.size()) + length;
++  if (!target.owned() && needed > target.capacity()) {
++    auto& frame = current_frame_packet();
++    const auto kind = &target == &frame.verts     ? FrameBufferKind::Vertex
++                      : &target == &frame.indices ? FrameBufferKind::Index
++                      : &target == &frame.storage ? FrameBufferKind::Storage
++                                                  : FrameBufferKind::Uniform;
++    if (!g_frameOverflowed) {
++      Log.warn("Frame buffer {} overflowed ({} of {} bytes); dropping the rest of this frame",
++               magic_enum::enum_name(kind), needed, target.capacity());
++    }
++    g_frameOverflowed = true;
++    request_buffer_growth(kind, needed);
++    return {};
++  }
+   if (alignment != 0) {
+     const size_t begin = target.size();
+     const size_t alignedBegin = AURORA_ALIGN(begin, alignment);
+@@ -580,6 +598,7 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
+   }
+   g_recorder.packet = &packet;
+   g_recorder.frameSlot = frameSlot;
++  g_frameOverflowed = false;
+   g_passSnapshotPools[frameSlot].used = 0;
+   g_recorder.drawCallCount = 0;
+   g_recorder.mergedDrawCallCount = 0;
+@@ -1228,6 +1247,8 @@ void finish() {
+   }
+ }
+ 
++bool frame_overflowed() noexcept { return g_frameOverflowed; }
++
+ Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
+   ZoneScoped;
+   if (!check_recording("push_verts")) {
+diff --git a/lib/gfx/recording.hpp b/lib/gfx/recording.hpp
+index b36d729..6851a74 100644
+--- a/lib/gfx/recording.hpp
++++ b/lib/gfx/recording.hpp
+@@ -75,6 +75,10 @@ struct ConvRequest;
+ }
+ void queue_palette_conv(tex_palette_conv::ConvRequest req);
+ 
++// True once a push this frame did not fit its frame buffer (the push returned an empty range):
++// draws skip themselves for the rest of the frame.
++bool frame_overflowed() noexcept;
++
+ Range push_verts(const uint8_t* data, size_t length, size_t alignment);
+ template <typename T>
+ Range push_verts(ArrayRef<T> data, size_t alignment) {
+diff --git a/lib/gfx/resources.hpp b/lib/gfx/resources.hpp
+index 3fdc0ee..1415249 100644
+--- a/lib/gfx/resources.hpp
++++ b/lib/gfx/resources.hpp
+@@ -5,10 +5,12 @@
+ namespace aurora::gfx {
+ inline constexpr bool UseTextureBuffer = true;
+ inline constexpr uint64_t UniformBufferSize = 25165824; // 24 MiB
+-inline constexpr uint64_t VertexBufferSize = 5242880;   // 5 MiB
+-inline constexpr uint64_t IndexBufferSize = 2097152;    // 2 MiB
+-inline constexpr uint64_t StorageBufferSize = 8388608;  // 8 MiB
+ inline constexpr uint64_t TextureUploadSize = 25165824; // 24 MiB
++// Vertex, index and storage buffers start at these sizes and grow when a frame overflows one
++// (the frame is cut short; the buffers are recreated larger before the next one).
++inline constexpr uint64_t InitialVertexBufferSize = 5242880;  // 5 MiB
++inline constexpr uint64_t InitialIndexBufferSize = 2097152;   // 2 MiB
++inline constexpr uint64_t InitialStorageBufferSize = 8388608; // 8 MiB
+ 
+ namespace detail {
+ struct Resources {
+@@ -16,6 +18,9 @@ struct Resources {
+   wgpu::Buffer uniformBuffer;
+   wgpu::Buffer indexBuffer;
+   wgpu::Buffer storageBuffer;
++  uint64_t vertexBufferSize = InitialVertexBufferSize;
++  uint64_t indexBufferSize = InitialIndexBufferSize;
++  uint64_t storageBufferSize = InitialStorageBufferSize;
+   wgpu::BindGroupLayout staticBindGroupLayout;
+   wgpu::BindGroup staticBindGroup;
+   wgpu::BindGroupLayout uniformBindGroupLayout;
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index be59752..89d758f 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -460,6 +460,9 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
+   } else if (prim == GX_POINTS) {
+     instanceCount = vtxCount;
+   }
++  if (gfx::frame_overflowed()) {
++    return;
++  }
+   cache.lastDrawFmt = fmt;
+   gfx::push_draw_command(DrawData{
+       .pipeline = cache.pipelineRef,
+@@ -486,6 +489,9 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, g
+     numIndices = prepare_idx_buffer(idxBuf, prim, 0, vtxCount);
+     idxRange = gfx::push_indices(idxBuf.data(), idxBuf.size(), 4);
+     idxBuf.clear();
++    if (gfx::frame_overflowed()) {
++      return;
++    }
+   }
+ 
+   push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, numIndices);
+@@ -510,7 +516,13 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+ 
+   // Push raw vertex data to buffer. Merged draws must remain contiguous with the previous range.
+   const auto vertexData = reader.take(totalVtxBytes);
++  if (gfx::frame_overflowed()) {
++    return; // the frame ran out of buffer space: the rest of it is dropped
++  }
+   gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), canMerge ? 0 : 4);
++  if (gfx::frame_overflowed()) {
++    return;
++  }
+ 
+   // Try to merge with previous draw call
+   if (canMerge) {
+@@ -526,6 +538,9 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, ByteReader&
+       numIndices += prepare_idx_buffer(idxBuf, prim, lastDraw->vtxCount, vtxCount);
+       idxRange = gfx::push_indices(idxBuf.data(), idxBuf.size(), hadIndexRange ? 0 : 4);
+       idxBuf.clear();
++      if (gfx::frame_overflowed()) {
++        return;
++      }
+     }
+     CHECK(lastDraw->vertRange.offset + lastDraw->vertRange.size == vertRange.offset,
+           "Non-consecutive vertex ranges ({} < {})", lastDraw->vertRange.offset + lastDraw->vertRange.size,
+@@ -756,7 +771,7 @@ void handle_aurora(ByteReader& reader) noexcept {
+     const u32 totalVtxBytes = vtxCount * vtxSize;
+     const auto vertexData = reader.take(totalVtxBytes);
+     const gfx::Range vertRange = gfx::push_verts(vertexData.data(), vertexData.size(), 4);
+-    if (indexCount != 0) {
++    if (indexCount != 0 && !gfx::frame_overflowed()) {
+       push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
+     }
+   } else if (subCmd == GX_AURORA_DEBUG_GROUP_PUSH) {
+diff --git a/lib/internal.hpp b/lib/internal.hpp
+index d1adb6c..9e6939a 100644
+--- a/lib/internal.hpp
++++ b/lib/internal.hpp
+@@ -284,6 +284,8 @@ public:
+   [[nodiscard]] const uint8_t* data() const noexcept { return m_data; }
+   [[nodiscard]] size_t size() const noexcept { return m_length; }
+   [[nodiscard]] bool empty() const noexcept { return m_length == 0; }
++  [[nodiscard]] size_t capacity() const noexcept { return m_capacity; }
++  [[nodiscard]] bool owned() const noexcept { return m_owned; }
+ 
+   void append(const void* data, size_t size) {
+     resize(m_length + size, false);

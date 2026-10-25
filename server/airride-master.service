@@ -1,0 +1,39 @@
+# systemd unit for the Air Ride master server (see DEPLOY.md).
+#   sudo cp airride-master.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now airride-master
+[Unit]
+Description=Kirby Air Ride: Recompiled online master server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=airride
+Group=airride
+WorkingDirectory=/opt/airride/server
+# The database lives in /var/lib/airride (created by StateDirectory, owned by the airride user).
+Environment=AIRRIDE_DB=/var/lib/airride/airride.db
+Environment=AIRRIDE_TCP_PORT=27600
+Environment=AIRRIDE_UDP_PORT=27601
+Environment=PYTHONUNBUFFERED=1
+# Optional: Environment=AIRRIDE_MOTD=Welcome to Air Ride online!
+ExecStart=/usr/bin/python3 -m airride_master serve
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=16384
+
+# Hardening: the server needs its database directory and the network, nothing else.
+StateDirectory=airride
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/airride
+
+[Install]
+WantedBy=multi-user.target

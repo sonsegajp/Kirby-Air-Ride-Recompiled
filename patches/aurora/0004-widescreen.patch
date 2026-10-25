@@ -1,0 +1,287 @@
+diff --git a/include/dolphin/gx/GXAurora.h b/include/dolphin/gx/GXAurora.h
+index 46f6ede..0aa0268 100644
+--- a/include/dolphin/gx/GXAurora.h
++++ b/include/dolphin/gx/GXAurora.h
+@@ -39,6 +39,17 @@ extern "C" {
+  */
+ #define GX_AURORA_LOAD_ARRAYBASE 0x0010
+ 
++/**
++ * Widescreen (see AuroraSetWidescreen): the commands up to the next one of these draw to the screen
++ * (u8 1) or render into a texture (u8 0, e.g. a shadow or reflection pass), which keeps plain mapping.
++ */
++#define GX_AURORA_WIDE_SEGMENT 0x0060
++/**
++ * Widescreen: placement of the following orthographic (2D) draws on a screen wider than the logical
++ * one: u8 0 centred, 1 left edge, 2 right edge, 3 stretched to the full width.
++ */
++#define GX_AURORA_WIDE_2D 0x0061
++
+ /**
+  * Pushes a debug group to the backend graphics API. These may show in debugging tools such as RenderDoc.
+  * Must be followed by a u16 string length and that many UTF-8 characters (no null terminator required).
+@@ -161,6 +172,14 @@ typedef enum _AuroraViewportPolicy {
+  */
+ void AuroraSetViewportPolicy(AuroraViewportPolicy policy);
+ 
++/**
++ * Widescreen for 4:3 content (with AURORA_VIEWPORT_STRETCH): perspective views spanning the screen
++ * see further to the sides instead of stretching (Hor+), other perspective viewports and 2D draws
++ * keep their aspect and move to the edge they are near (GX_AURORA_WIDE_2D), render-to-texture passes
++ * are left alone (GX_AURORA_WIDE_SEGMENT).
++ */
++void AuroraSetWidescreen(bool enabled);
++
+ /**
+  * Retrieves the current content framebuffer size.
+  */
+diff --git a/lib/dolphin/gx/GXAurora.cpp b/lib/dolphin/gx/GXAurora.cpp
+index 0d91aed..0ab19ed 100644
+--- a/lib/dolphin/gx/GXAurora.cpp
++++ b/lib/dolphin/gx/GXAurora.cpp
+@@ -35,6 +35,7 @@ void GXInsertDebugMarker(const char* label) {
+ }
+ 
+ void AuroraSetViewportPolicy(AuroraViewportPolicy policy) { aurora::gx::set_viewport_policy(policy); }
++void AuroraSetWidescreen(bool enabled) { aurora::gx::set_widescreen(enabled); }
+ 
+ void AuroraGetRenderSize(u32* width, u32* height) {
+   const auto windowSize = aurora::window::get_window_size();
+diff --git a/lib/dolphin/gx/GXFrameBuffer.cpp b/lib/dolphin/gx/GXFrameBuffer.cpp
+index 3460090..5821c62 100644
+--- a/lib/dolphin/gx/GXFrameBuffer.cpp
++++ b/lib/dolphin/gx/GXFrameBuffer.cpp
+@@ -33,7 +33,7 @@ aurora::Vec2<uint32_t> scale_copy_dst(u32 logicalWidth, u32 logicalHeight) {
+ 
+ namespace aurora::gx {
+ void copy_tex(const void* dest, GXBool clear) noexcept {
+-  const auto rect = map_logical_scissor(g_gxState.texCopySrc);
++  const auto rect = map_logical_rect_stretched(g_gxState.texCopySrc);
+   const auto [dstWidth, dstHeight] = scale_copy_dst(g_gxState.texCopyDstWidth, g_gxState.texCopyDstHeight);
+   const auto texCopyFmt = g_gxState.texCopyFmt;
+   const auto copy = texture::resolve_copy_texture({
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index 89d758f..4682c17 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -608,6 +608,20 @@ void handle_aurora(ByteReader& reader) noexcept {
+       g_gxState.xfRegValid.reset(reg);
+     }
+     g_gxState.dirty |= DirtyUniform;
++  } else if (subCmd == GX_AURORA_WIDE_SEGMENT) {
++    const u8 segment = reader.read<u8>();
++    if (segment != g_gxState.wideSegment) {
++      g_gxState.wideSegment = segment;
++      remap_viewport();
++    }
++  } else if (subCmd == GX_AURORA_WIDE_2D) {
++    const u8 placement = reader.read<u8>();
++    if (placement != g_gxState.wide2D) {
++      g_gxState.wide2D = placement;
++      if (g_gxState.projType == GX_ORTHOGRAPHIC) {
++        remap_viewport();
++      }
++    }
+   } else if (subCmd >= GX_AURORA_LOAD_ARRAYBASE && subCmd <= (GX_AURORA_LOAD_ARRAYBASE | 0x0f)) {
+     const u32 attrIdx = subCmd - GX_AURORA_LOAD_ARRAYBASE + GX_VA_POS;
+     const u64 arrayAddr = reader.read<u64>();
+diff --git a/lib/gx/gx.cpp b/lib/gx/gx.cpp
+index 490de4c..1d7ef55 100644
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -235,6 +235,62 @@ Vec2<uint32_t> logical_fb_size() noexcept {
+   return gfx::is_offscreen() ? gfx::get_render_target_size() : vi::configured_fb_size();
+ }
+ 
++namespace {
++std::atomic_bool sWidescreen{false};
++
++// Where the current draws go on a target wider than the logical screen: stretched across it like
++// the plain mapping (wide perspective views, full-width 2D, texture passes), or kept at the
++// logical aspect and moved by dx logical units toward the edge they are near.
++struct WidePlacement {
++  bool stretch;
++  float dx;
++};
++WidePlacement wide_placement(float logicalWidth, const gfx::Viewport& viewport) noexcept {
++  const float w = widescreen_factor();
++  if (w <= 1.f || widescreen_expands()) {
++    return {true, 0.f};
++  }
++  int anchor = g_gxState.wide2D;
++  if (g_gxState.projType == GX_PERSPECTIVE) {  // a small 3D viewport (a HUD model): by its centre
++    const float cx = viewport.left + viewport.width * 0.5f;
++    anchor = cx < 0.3f * logicalWidth ? 1 : cx > 0.7f * logicalWidth ? 2 : 0;
++  }
++  if (anchor == 3) {
++    return {true, 0.f};
++  }
++  const float edge = (w - 1.f) * logicalWidth * 0.5f;
++  return {false, anchor == 1 ? -edge : anchor == 2 ? edge : 0.f};
++}
++} // namespace
++
++void set_widescreen(bool enabled) noexcept { sWidescreen.store(enabled, std::memory_order_release); }
++
++float widescreen_factor() noexcept {
++  if (!sWidescreen.load(std::memory_order_acquire) || g_gxState.wideSegment == 0 || gfx::is_offscreen() ||
++      g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
++    return 1.f;
++  }
++  const auto [logicalW, logicalH] = logical_fb_size();
++  const auto [targetW, targetH] = gfx::get_render_target_size();
++  if (logicalW == 0 || logicalH == 0 || targetW == 0 || targetH == 0) {
++    return 1.f;
++  }
++  const float w = (static_cast<float>(targetW) / static_cast<float>(targetH)) /
++                  (static_cast<float>(logicalW) / static_cast<float>(logicalH));
++  return w > 1.001f ? w : 1.f;
++}
++
++bool widescreen_expands() noexcept {
++  return widescreen_factor() > 1.f && g_gxState.projType == GX_PERSPECTIVE &&
++         g_gxState.logicalViewport.width >= 0.47f * static_cast<float>(logical_fb_size().x);
++}
++
++void remap_viewport() noexcept {
++  set_render_viewport(map_logical_viewport(g_gxState.logicalViewport));
++  set_render_scissor(map_logical_scissor(g_gxState.logicalScissor));
++  g_gxState.dirty |= DirtyUniform;
++}
++
+ gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept {
+   if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
+     return logicalViewport;
+@@ -248,6 +304,19 @@ gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcep
+ 
+   const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
+   const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
++  const auto place = wide_placement(static_cast<float>(logicalFbWidth), logicalViewport);
++  if (!place.stretch) {  // logical aspect (scaleY both ways), centred, moved toward its edge
++    const float left = static_cast<float>(targetWidth) * 0.5f +
++                       (logicalViewport.left + place.dx - static_cast<float>(logicalFbWidth) * 0.5f) * scaleY;
++    return {
++        .left = left,
++        .top = logicalViewport.top * scaleY,
++        .width = logicalViewport.width * scaleY,
++        .height = logicalViewport.height * scaleY,
++        .znear = logicalViewport.znear,
++        .zfar = logicalViewport.zfar,
++    };
++  }
+   return {
+       .left = logicalViewport.left * scaleX,
+       .top = logicalViewport.top * scaleY,
+@@ -258,7 +327,8 @@ gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcep
+   };
+ }
+ 
+-gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept {
++namespace {
++gfx::ClipRect map_rect(const gfx::ClipRect& logicalScissor, bool allowWide) noexcept {
+   if (g_gxState.viewportPolicy == AURORA_VIEWPORT_NATIVE) {
+     return logicalScissor;
+   }
+@@ -269,12 +339,23 @@ gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept
+     return logicalScissor;
+   }
+ 
+-  const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
++  float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
+   const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
++  float offsetX = 0.f;
++  if (allowWide) {
++    // A scissor covering the whole logical screen keeps covering the whole target: 2D moved to the
++    // edges must not be clipped by it.
++    const bool full = logicalScissor.x <= 0 && logicalScissor.x + logicalScissor.width >= static_cast<int32_t>(logicalFbWidth);
++    const auto place = wide_placement(static_cast<float>(logicalFbWidth), g_gxState.logicalViewport);
++    if (!place.stretch && !full) {
++      scaleX = scaleY;
++      offsetX = static_cast<float>(targetWidth) * 0.5f + (place.dx - static_cast<float>(logicalFbWidth) * 0.5f) * scaleY;
++    }
++  }
+ 
+-  const float left = static_cast<float>(logicalScissor.x) * scaleX;
++  const float left = offsetX + static_cast<float>(logicalScissor.x) * scaleX;
+   const float top = static_cast<float>(logicalScissor.y) * scaleY;
+-  const float right = static_cast<float>(logicalScissor.x + logicalScissor.width) * scaleX;
++  const float right = offsetX + static_cast<float>(logicalScissor.x + logicalScissor.width) * scaleX;
+   const float bottom = static_cast<float>(logicalScissor.y + logicalScissor.height) * scaleY;
+ 
+   const auto mappedLeft = std::clamp(static_cast<int32_t>(std::floor(left)), 0, static_cast<int32_t>(targetWidth));
+@@ -291,6 +372,11 @@ gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept
+       .height = mappedBottom - mappedTop,
+   };
+ }
++} // namespace
++
++gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept { return map_rect(logicalScissor, true); }
++
++gfx::ClipRect map_logical_rect_stretched(const gfx::ClipRect& logicalRect) noexcept { return map_rect(logicalRect, false); }
+ 
+ void set_logical_viewport(const gfx::Viewport& viewport) noexcept {
+   if (viewport.left != g_gxState.logicalViewport.left || viewport.width != g_gxState.logicalViewport.width ||
+diff --git a/lib/gx/gx.hpp b/lib/gx/gx.hpp
+index 77a821d..b8b24d5 100644
+--- a/lib/gx/gx.hpp
++++ b/lib/gx/gx.hpp
+@@ -401,6 +401,10 @@ struct GXState {
+   gfx::Viewport logicalViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
+   gfx::Viewport renderViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
+   gfx::ClipRect logicalScissor{0, 0, 640, 480};
++  // Widescreen (AuroraSetWidescreen): whether the current commands draw to the screen (1) or into a
++  // texture (0), and where orthographic draws go (0 centre, 1 left, 2 right, 3 full width).
++  u8 wideSegment = 1;
++  u8 wide2D = 0;
+   gfx::ClipRect renderScissor{0, 0, 640, 480};
+ 
+   // EFB copy state
+@@ -448,6 +452,11 @@ void evict_tlut_object(u32 tlutObjId) noexcept;
+ Vec2<uint32_t> logical_fb_size() noexcept;
+ gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept;
+ gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept;
++gfx::ClipRect map_logical_rect_stretched(const gfx::ClipRect& logicalRect) noexcept;  // EFB copies
++void set_widescreen(bool enabled) noexcept;
++float widescreen_factor() noexcept;     // render target aspect over logical aspect (1 = not wider)
++bool widescreen_expands() noexcept;     // the current perspective view is widened (Hor+)
++void remap_viewport() noexcept;         // re-apply the logical viewport/scissor after a mode change
+ void set_logical_viewport(const gfx::Viewport& viewport) noexcept;
+ void set_render_viewport(const gfx::Viewport& viewport) noexcept;
+ void set_logical_scissor(const gfx::ClipRect& scissor) noexcept;
+diff --git a/lib/gx/regs.cpp b/lib/gx/regs.cpp
+index 971ddd7..78689f9 100644
+--- a/lib/gx/regs.cpp
++++ b/lib/gx/regs.cpp
+@@ -927,6 +927,7 @@ void xf_load_projection(const u8* data) noexcept {
+   f32 p4 = read_bits<f32>(data + 16);
+   f32 p5 = read_bits<f32>(data + 20);
+   u32 projType = read_bits<u32>(data + 24);
++  const bool typeChanged = g_gxState.projType != static_cast<GXProjectionType>(projType);
+   g_gxState.projType = static_cast<GXProjectionType>(projType);
+   auto& proj = g_gxState.proj;
+   proj = {};
+@@ -944,6 +945,9 @@ void xf_load_projection(const u8* data) noexcept {
+     proj.m3[2] = -1.0f;
+   }
+   g_gxState.dirty |= DirtyUniform;
++  if (typeChanged) {
++    remap_viewport();  // widescreen placement depends on the projection type
++  }
+ }
+ 
+ // Compare raw bits instead of floats
+diff --git a/lib/gx/shader_info.cpp b/lib/gx/shader_info.cpp
+index 74614a7..c14ef71 100644
+--- a/lib/gx/shader_info.cpp
++++ b/lib/gx/shader_info.cpp
+@@ -476,6 +476,10 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
+     }
+   }
+   auto proj = g_gxState.proj;
++  if (widescreen_expands()) {  // Hor+: the viewport was widened, so narrow clip-space x to match
++    const float inv = 1.f / widescreen_factor();
++    proj.m0 = proj.m0 * Vec4{inv, inv, inv, inv};
++  }
+   if constexpr (UseReversedZ) {
+     proj.m2 = proj.m2 * Vec4{-1.f, -1.f, -1.f, -1.f};
+   } else {

@@ -1,0 +1,5 @@
+# Patches for the Aurora submodule are applied with git apply: they must keep LF line endings.
+*.patch text eol=lf
+*.sh text eol=lf
+# Windows batch files need CRLF line endings (labels misbehave otherwise).
+*.bat text eol=crlf

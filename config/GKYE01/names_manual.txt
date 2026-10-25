@@ -1,0 +1,4 @@
+# Hand-identified functions: address name library translation-unit why
+803D7D08 __OSInitMemoryProtection os OSMemory.c follows-RealMode;MEM-int-handlers-0-4+OSRegisterResetFunction+RealMode(Config24MB/48MB)
+803AE238 __setjmp Runtime.PPCEABI.H setjmp.c mflr+mfcr;stw-lr/cr/r1/r2;stmw-r13;stfd+psq_st-f14-f31;callers-802400A8/8024020C
+803AE33C longjmp Runtime.PPCEABI.H setjmp.c restores-what-803AE238-saves;r3=r4-or-1;called-from-8023F500

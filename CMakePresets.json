@@ -1,0 +1,16 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows-clang",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/windows-clang",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl"
+      }
+    }
+  ],
+  "buildPresets": [ { "name": "windows-clang", "configurePreset": "windows-clang" } ]
+}

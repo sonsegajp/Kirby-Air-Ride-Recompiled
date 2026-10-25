@@ -1,0 +1,32 @@
+# Game data never enters the repo: the user's own disc is read at setup time.
+orig/
+*.iso
+*.rvz
+*.dol
+*.rel
+build/
+out/
+__pycache__/
+*.pyc
+saves/
+mods/
+# Local state: settings, logs, HD textures, the upscaler (Python, PyTorch, models: fetched by
+# tools/hd/setup.ps1 - the HDcube licence does not allow redistributing the model)
+launcher.ini
+*.log
+textures/
+tools/hd/venv/
+tools/hd/python/
+tools/hd/models/
+tools/hd/download/
+tools/hd/setup_status.txt
+dist/
+# Assistant notes stay local
+CLAUDE.md
+.claude/
+# The official online service's address (CMakeLists.txt: KAR_ONLINE_MASTER), the developer's settings and notes
+online_master.txt
+kirbyairride-settings.ini
+build_log.txt
+docs/HANDOFF.md
+disc.txt

@@ -1,0 +1,31 @@
+diff --git a/lib/window.cpp b/lib/window.cpp
+index cf84de3..0cb00c2 100644
+--- a/lib/window.cpp
++++ b/lib/window.cpp
+@@ -1,3 +1,4 @@
++#include <cstdlib>
+ #include "window.hpp"
+ 
+ #ifdef AURORA_ENABLE_GX
+@@ -420,6 +421,9 @@ void destroy_window() {
+ }
+ 
+ void show_window() {
++  if (std::getenv("AURORA_HEADLESS") != nullptr) {
++    return;
++  }
+   if (g_window != nullptr) {
+     TRY_WARN(SDL_ShowWindow(g_window), "Failed to show window: {}", SDL_GetError());
+   }
+@@ -514,6 +518,11 @@ SDL_Window* get_sdl_window() { return g_window; }
+ SDL_Renderer* get_sdl_renderer() { return g_renderer; }
+ 
+ bool is_paused() noexcept {
++  // AURORA_HEADLESS: render with the window kept hidden (automated runs, frame dumps).
++  static const bool headless = std::getenv("AURORA_HEADLESS") != nullptr;
++  if (headless) {
++    return false;
++  }
+   if (!is_presentable()) {
+     return true;
+   }

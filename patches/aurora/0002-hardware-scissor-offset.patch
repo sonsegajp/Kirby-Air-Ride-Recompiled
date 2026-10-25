@@ -1,0 +1,44 @@
+diff --git a/lib/dolphin/gx/GXCull.cpp b/lib/dolphin/gx/GXCull.cpp
+index e884c51..b32a62b 100644
+--- a/lib/dolphin/gx/GXCull.cpp
++++ b/lib/dolphin/gx/GXCull.cpp
+@@ -24,8 +24,9 @@ void GXSetScissor(u32 left, u32 top, u32 width, u32 height) {
+ void GXSetScissorBoxOffset(s32 x, s32 y) {
+   u32 reg = 0;
+ 
+-  u32 hx = (x + static_cast<u32>(kViewOffset)) >> 1;
+-  u32 hy = (y + static_cast<u32>(kViewOffset)) >> 1;
++  // Hardware encoding (as the SDK writes it): (offset + 342) / 2.
++  u32 hx = static_cast<u32>(x - kViewOffset) >> 1;
++  u32 hy = static_cast<u32>(y - kViewOffset) >> 1;
+   SET_REG_FIELD(0, reg, 10, 0, hx);
+   SET_REG_FIELD(0, reg, 10, 10, hy);
+   SET_REG_FIELD(0, reg, 8, 24, 0x59);
+diff --git a/lib/gx/regs.cpp b/lib/gx/regs.cpp
+index a059918..971ddd7 100644
+--- a/lib/gx/regs.cpp
++++ b/lib/gx/regs.cpp
+@@ -135,14 +135,15 @@ void bp_scissor(u8, u32) noexcept {
+   const u32 scis1 = g_gxState.bpRegCache[0x21];
+ 
+   const u32 boxOffset = g_gxState.bpRegCache[0x59];
+-  // The box offset fields are signed 9-bit values and also halved, like the viewport registers. Sign extend.
+-  const s32 offsX = static_cast<s32>(reg_get(boxOffset, 10, 0)) << 23 >> 22;
+-  const s32 offsY = static_cast<s32>(reg_get(boxOffset, 10, 10)) << 23 >> 22;
+-
+-  const s32 tp = static_cast<s32>(reg_get(scis0, 11, 0)) + offsY;
+-  const s32 lf = static_cast<s32>(reg_get(scis0, 11, 12)) + offsX;
+-  const s32 bm = static_cast<s32>(reg_get(scis1, 11, 0)) + offsY;
+-  const s32 rt = static_cast<s32>(reg_get(scis1, 11, 12)) + offsX;
++  // Hardware semantics: the SDK writes (offset + 342) / 2 into each 10-bit field, and the box is
++  // shifted back by twice the field (which also removes the +342 bias of the box coordinates).
++  const s32 offsX = static_cast<s32>(reg_get(boxOffset, 10, 0)) * 2;
++  const s32 offsY = static_cast<s32>(reg_get(boxOffset, 10, 10)) * 2;
++
++  const s32 tp = static_cast<s32>(reg_get(scis0, 11, 0)) - offsY;
++  const s32 lf = static_cast<s32>(reg_get(scis0, 11, 12)) - offsX;
++  const s32 bm = static_cast<s32>(reg_get(scis1, 11, 0)) - offsY;
++  const s32 rt = static_cast<s32>(reg_get(scis1, 11, 12)) - offsX;
+   const s32 wd = std::max(rt - lf + 1, 0);
+   const s32 ht = std::max(bm - tp + 1, 0);
+   set_logical_scissor({lf, tp, wd, ht});

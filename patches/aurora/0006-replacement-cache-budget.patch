@@ -1,0 +1,39 @@
+diff --git a/include/aurora/texture.hpp b/include/aurora/texture.hpp
+index 6c68778..1883ee6 100644
+--- a/include/aurora/texture.hpp
++++ b/include/aurora/texture.hpp
+@@ -90,6 +90,8 @@ void unregister_replacements(std::span<const ReplacementRegistration> registrati
+ void unregister_replacements(const ReplacementGroup& group);
+ void unregister_replacements(const ReplacementKey& key);
+ void clear_replacements();
++/// Most bytes of GPU memory loaded replacements keep (least recently used ones go first); 4 GB by default.
++void set_replacement_cache_budget(uint64_t bytes);
+ 
+ ReplacementGroup load_replacement_directory(const std::filesystem::path& root, ReplacementOptions options = {});
+ void reload_replacement_directory(const std::filesystem::path& root, ReplacementGroup& group,
+diff --git a/lib/gfx/texture_replacement.cpp b/lib/gfx/texture_replacement.cpp
+index 03dda46..580b865 100644
+--- a/lib/gfx/texture_replacement.cpp
++++ b/lib/gfx/texture_replacement.cpp
+@@ -42,7 +42,7 @@ namespace aurora::texture {
+ namespace {
+ constexpr Module Log{"aurora::texture"};
+ 
+-constexpr uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB
++uint64_t kReplacementCacheBudgetBytes = 4294967296; // 4GB by default; set_replacement_cache_budget()
+ constexpr uint64_t kReplacementWildcardTextureHash = kWildcardTextureHash;
+ constexpr uint64_t kReplacementWildcardTlutHash = kWildcardTlutHash;
+ 
+@@ -1569,6 +1569,12 @@ void unregister_replacements(const ReplacementKey& key) {
+   }
+ }
+ 
++void set_replacement_cache_budget(uint64_t bytes) {
++  std::lock_guard lk(s_registryMutex);
++  kReplacementCacheBudgetBytes = bytes;
++  evict_replacement_cache_if_needed();
++}
++
+ void clear_replacements() {
+   std::vector<std::shared_ptr<VirtualReadState>> waitStates;
+   {

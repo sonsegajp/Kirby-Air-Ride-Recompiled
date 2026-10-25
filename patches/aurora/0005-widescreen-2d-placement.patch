@@ -1,0 +1,232 @@
+diff --git a/include/dolphin/gx/GXAurora.h b/include/dolphin/gx/GXAurora.h
+index 0aa0268..ca5c697 100644
+--- a/include/dolphin/gx/GXAurora.h
++++ b/include/dolphin/gx/GXAurora.h
+@@ -45,10 +45,21 @@ extern "C" {
+  */
+ #define GX_AURORA_WIDE_SEGMENT 0x0060
+ /**
+- * Widescreen: placement of the following orthographic (2D) draws on a screen wider than the logical
+- * one: u8 0 centred, 1 left edge, 2 right edge, 3 stretched to the full width.
++ * Widescreen: placement of the following draws on a screen wider than the logical one, a u8: 2D
++ * (orthographic, or sprites the game draws in perspective) at the logical aspect centred, at the left
++ * or right edge, stretched to the full width, or covering the screen (scaled to its width, cropped
++ * top and bottom); or 3D, which spanning the screen sees further to the sides (Hor+) and in a small
++ * viewport keeps its aspect, moved to the edge it is near.
+  */
+ #define GX_AURORA_WIDE_2D 0x0061
++enum GXAuroraWide2D {
++  GX_AURORA_WIDE_CENTRE = 0,
++  GX_AURORA_WIDE_LEFT = 1,
++  GX_AURORA_WIDE_RIGHT = 2,
++  GX_AURORA_WIDE_STRETCH = 3,
++  GX_AURORA_WIDE_3D = 4,
++  GX_AURORA_WIDE_COVER = 5,
++};
+ 
+ /**
+  * Pushes a debug group to the backend graphics API. These may show in debugging tools such as RenderDoc.
+@@ -175,8 +186,8 @@ void AuroraSetViewportPolicy(AuroraViewportPolicy policy);
+ /**
+  * Widescreen for 4:3 content (with AURORA_VIEWPORT_STRETCH): perspective views spanning the screen
+  * see further to the sides instead of stretching (Hor+), other perspective viewports and 2D draws
+- * keep their aspect and move to the edge they are near (GX_AURORA_WIDE_2D), render-to-texture passes
+- * are left alone (GX_AURORA_WIDE_SEGMENT).
++ * keep their aspect and move to the edge they are near or fill the screen (GX_AURORA_WIDE_2D),
++ * render-to-texture passes are left alone (GX_AURORA_WIDE_SEGMENT).
+  */
+ void AuroraSetWidescreen(bool enabled);
+ 
+diff --git a/lib/gx/command_processor.cpp b/lib/gx/command_processor.cpp
+index 4682c17..e6c10ec 100644
+--- a/lib/gx/command_processor.cpp
++++ b/lib/gx/command_processor.cpp
+@@ -618,9 +618,7 @@ void handle_aurora(ByteReader& reader) noexcept {
+     const u8 placement = reader.read<u8>();
+     if (placement != g_gxState.wide2D) {
+       g_gxState.wide2D = placement;
+-      if (g_gxState.projType == GX_ORTHOGRAPHIC) {
+-        remap_viewport();
+-      }
++      remap_viewport();
+     }
+   } else if (subCmd >= GX_AURORA_LOAD_ARRAYBASE && subCmd <= (GX_AURORA_LOAD_ARRAYBASE | 0x0f)) {
+     const u32 attrIdx = subCmd - GX_AURORA_LOAD_ARRAYBASE + GX_VA_POS;
+diff --git a/lib/gx/gx.cpp b/lib/gx/gx.cpp
+index 1d7ef55..fd27073 100644
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -239,30 +239,67 @@ namespace {
+ std::atomic_bool sWidescreen{false};
+ 
+ // Where the current draws go on a target wider than the logical screen: stretched across it like
+-// the plain mapping (wide perspective views, full-width 2D, texture passes), or kept at the
+-// logical aspect and moved by dx logical units toward the edge they are near.
++// the plain mapping (wide perspective views, full-width 2D, texture passes), scaled to its width
++// (cover: full-screen art, cropped top and bottom), or kept at the logical aspect and moved by dx
++// logical units toward the edge they are near (anchored).
+ struct WidePlacement {
+-  bool stretch;
++  enum Kind { Stretch, Cover, Anchor } kind;
+   float dx;
+ };
+ WidePlacement wide_placement(float logicalWidth, const gfx::Viewport& viewport) noexcept {
+   const float w = widescreen_factor();
+   if (w <= 1.f || widescreen_expands()) {
+-    return {true, 0.f};
++    return {WidePlacement::Stretch, 0.f};
+   }
+   int anchor = g_gxState.wide2D;
+-  if (g_gxState.projType == GX_PERSPECTIVE) {  // a small 3D viewport (a HUD model): by its centre
++  if (anchor == GX_AURORA_WIDE_3D) {  // 3D in a small viewport (a HUD model): by its centre
+     const float cx = viewport.left + viewport.width * 0.5f;
+-    anchor = cx < 0.3f * logicalWidth ? 1 : cx > 0.7f * logicalWidth ? 2 : 0;
++    anchor = cx < 0.3f * logicalWidth ? GX_AURORA_WIDE_LEFT : cx > 0.7f * logicalWidth ? GX_AURORA_WIDE_RIGHT
++                                                                                      : GX_AURORA_WIDE_CENTRE;
+   }
+-  if (anchor == 3) {
+-    return {true, 0.f};
++  if (anchor == GX_AURORA_WIDE_STRETCH) {
++    return {WidePlacement::Stretch, 0.f};
++  }
++  if (anchor == GX_AURORA_WIDE_COVER) {
++    return {WidePlacement::Cover, 0.f};
+   }
+   const float edge = (w - 1.f) * logicalWidth * 0.5f;
+-  return {false, anchor == 1 ? -edge : anchor == 2 ? edge : 0.f};
++  return {WidePlacement::Anchor, anchor == GX_AURORA_WIDE_LEFT ? -edge : anchor == GX_AURORA_WIDE_RIGHT ? edge : 0.f};
+ }
++
++// A small 3D viewport is placed by moving the viewport itself; 2D keeps the plain (stretched)
++// viewport and is placed through its projection (widescreen_clip), so that what reaches past the
++// logical screen's edges (the title's bubbles, sprites sliding in) is not clipped there.
++bool viewport_moves() noexcept { return g_gxState.wide2D == GX_AURORA_WIDE_3D && !widescreen_expands(); }
+ } // namespace
+ 
++WideClip widescreen_clip() noexcept {
++  const float w = widescreen_factor();
++  if (w <= 1.f) {
++    return {};
++  }
++  if (widescreen_expands()) {  // Hor+: the viewport was widened, so narrow clip-space x to match
++    return {.sx = 1.f / w};
++  }
++  if (g_gxState.wide2D == GX_AURORA_WIDE_3D) {
++    return {};
++  }
++  const auto& vp = g_gxState.logicalViewport;
++  const auto [logicalW, logicalH] = logical_fb_size();
++  const float lw = static_cast<float>(logicalW), lh = static_cast<float>(logicalH);
++  if (vp.width <= 0.f || vp.height <= 0.f) {
++    return {};
++  }
++  const auto place = wide_placement(lw, vp);
++  if (place.kind == WidePlacement::Cover) {  // y scaled by w about the screen's middle
++    return {.sy = w, .ty = -(w - 1.f) * (vp.height + 2.f * vp.top - lh) / vp.height};
++  }
++  if (place.kind == WidePlacement::Anchor) {  // x at the logical aspect about the screen's middle, + dx
++    return {.sx = 1.f / w, .tx = ((w - 1.f) * (lw - 2.f * vp.left - vp.width) + 2.f * place.dx) / (vp.width * w)};
++  }
++  return {};
++}
++
+ void set_widescreen(bool enabled) noexcept { sWidescreen.store(enabled, std::memory_order_release); }
+ 
+ float widescreen_factor() noexcept {
+@@ -281,7 +318,7 @@ float widescreen_factor() noexcept {
+ }
+ 
+ bool widescreen_expands() noexcept {
+-  return widescreen_factor() > 1.f && g_gxState.projType == GX_PERSPECTIVE &&
++  return widescreen_factor() > 1.f && g_gxState.projType == GX_PERSPECTIVE && g_gxState.wide2D == GX_AURORA_WIDE_3D &&
+          g_gxState.logicalViewport.width >= 0.47f * static_cast<float>(logical_fb_size().x);
+ }
+ 
+@@ -305,7 +342,7 @@ gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcep
+   const float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
+   const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
+   const auto place = wide_placement(static_cast<float>(logicalFbWidth), logicalViewport);
+-  if (!place.stretch) {  // logical aspect (scaleY both ways), centred, moved toward its edge
++  if (place.kind == WidePlacement::Anchor && viewport_moves()) {  // logical aspect (scaleY both ways), centred, moved toward its edge
+     const float left = static_cast<float>(targetWidth) * 0.5f +
+                        (logicalViewport.left + place.dx - static_cast<float>(logicalFbWidth) * 0.5f) * scaleY;
+     return {
+@@ -340,23 +377,26 @@ gfx::ClipRect map_rect(const gfx::ClipRect& logicalScissor, bool allowWide) noex
+   }
+ 
+   float scaleX = static_cast<float>(targetWidth) / static_cast<float>(logicalFbWidth);
+-  const float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
+-  float offsetX = 0.f;
++  float scaleY = static_cast<float>(targetHeight) / static_cast<float>(logicalFbHeight);
++  float offsetX = 0.f, offsetY = 0.f;
+   if (allowWide) {
+     // A scissor covering the whole logical screen keeps covering the whole target: 2D moved to the
+-    // edges must not be clipped by it.
++    // edges or scaled past it must not be clipped by it.
+     const bool full = logicalScissor.x <= 0 && logicalScissor.x + logicalScissor.width >= static_cast<int32_t>(logicalFbWidth);
+     const auto place = wide_placement(static_cast<float>(logicalFbWidth), g_gxState.logicalViewport);
+-    if (!place.stretch && !full) {
++    if (place.kind == WidePlacement::Cover && !full) {
++      scaleY = scaleX;
++      offsetY = static_cast<float>(targetHeight) * 0.5f - static_cast<float>(logicalFbHeight) * 0.5f * scaleX;
++    } else if (place.kind == WidePlacement::Anchor && !full) {
+       scaleX = scaleY;
+       offsetX = static_cast<float>(targetWidth) * 0.5f + (place.dx - static_cast<float>(logicalFbWidth) * 0.5f) * scaleY;
+     }
+   }
+ 
+   const float left = offsetX + static_cast<float>(logicalScissor.x) * scaleX;
+-  const float top = static_cast<float>(logicalScissor.y) * scaleY;
++  const float top = offsetY + static_cast<float>(logicalScissor.y) * scaleY;
+   const float right = offsetX + static_cast<float>(logicalScissor.x + logicalScissor.width) * scaleX;
+-  const float bottom = static_cast<float>(logicalScissor.y + logicalScissor.height) * scaleY;
++  const float bottom = offsetY + static_cast<float>(logicalScissor.y + logicalScissor.height) * scaleY;
+ 
+   const auto mappedLeft = std::clamp(static_cast<int32_t>(std::floor(left)), 0, static_cast<int32_t>(targetWidth));
+   const auto mappedTop = std::clamp(static_cast<int32_t>(std::floor(top)), 0, static_cast<int32_t>(targetHeight));
+diff --git a/lib/gx/gx.hpp b/lib/gx/gx.hpp
+index b8b24d5..9ecf806 100644
+--- a/lib/gx/gx.hpp
++++ b/lib/gx/gx.hpp
+@@ -402,9 +402,10 @@ struct GXState {
+   gfx::Viewport renderViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
+   gfx::ClipRect logicalScissor{0, 0, 640, 480};
+   // Widescreen (AuroraSetWidescreen): whether the current commands draw to the screen (1) or into a
+-  // texture (0), and where orthographic draws go (0 centre, 1 left, 2 right, 3 full width).
++  // texture (0), and where the current draws go (GXAuroraWide2D: 2D at an anchor, stretched,
++  // covering the screen, or 3D placed by its viewport).
+   u8 wideSegment = 1;
+-  u8 wide2D = 0;
++  u8 wide2D = GX_AURORA_WIDE_3D;
+   gfx::ClipRect renderScissor{0, 0, 640, 480};
+ 
+   // EFB copy state
+@@ -456,6 +457,11 @@ gfx::ClipRect map_logical_rect_stretched(const gfx::ClipRect& logicalRect) noexc
+ void set_widescreen(bool enabled) noexcept;
+ float widescreen_factor() noexcept;     // render target aspect over logical aspect (1 = not wider)
+ bool widescreen_expands() noexcept;     // the current perspective view is widened (Hor+)
++// Clip-space placement of the current draws on a wide target: x' = sx*x + tx*w, y' = sy*y + ty*w.
++struct WideClip {
++  float sx = 1.f, tx = 0.f, sy = 1.f, ty = 0.f;
++};
++WideClip widescreen_clip() noexcept;
+ void remap_viewport() noexcept;         // re-apply the logical viewport/scissor after a mode change
+ void set_logical_viewport(const gfx::Viewport& viewport) noexcept;
+ void set_render_viewport(const gfx::Viewport& viewport) noexcept;
+diff --git a/lib/gx/shader_info.cpp b/lib/gx/shader_info.cpp
+index c14ef71..9ba1779 100644
+--- a/lib/gx/shader_info.cpp
++++ b/lib/gx/shader_info.cpp
+@@ -476,9 +476,9 @@ static void fill_uniform(ByteBuffer& buf, const ShaderInfo& info) noexcept {
+     }
+   }
+   auto proj = g_gxState.proj;
+-  if (widescreen_expands()) {  // Hor+: the viewport was widened, so narrow clip-space x to match
+-    const float inv = 1.f / widescreen_factor();
+-    proj.m0 = proj.m0 * Vec4{inv, inv, inv, inv};
++  if (const auto clip = widescreen_clip(); clip.sx != 1.f || clip.tx != 0.f || clip.sy != 1.f || clip.ty != 0.f) {
++    proj.m0 = proj.m0 * Vec4{clip.sx, clip.sx, clip.sx, clip.sx} + proj.m3 * Vec4{clip.tx, clip.tx, clip.tx, clip.tx};
++    proj.m1 = proj.m1 * Vec4{clip.sy, clip.sy, clip.sy, clip.sy} + proj.m3 * Vec4{clip.ty, clip.ty, clip.ty, clip.ty};
+   }
+   if constexpr (UseReversedZ) {
+     proj.m2 = proj.m2 * Vec4{-1.f, -1.f, -1.f, -1.f};

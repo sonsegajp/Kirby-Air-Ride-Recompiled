@@ -1,0 +1,62 @@
+--- a/lib/gx/gx.cpp
++++ b/lib/gx/gx.cpp
+@@ -131,8 +131,58 @@
+     };
+     break;
+   case GX_BM_LOGIC:
++    // WebGPU has no logic ops: the bitwise ones are approximated with blending on [0, 1] values
++    // (s & d ~ s*d, s | d ~ s + d - s*d, s ^ d ~ s(1-d) + d(1-s)), as Dolphin does on hosts without
++    // logic ops. The ones blending cannot express (they need a constant 1) fall back to COPY.
+     switch (op) {
+-      DEFAULT_FATAL("unsupported logic op {}", underlying(op));
++    default: {
++      static bool s_warned[16];
++      if (!s_warned[underlying(op) & 15]) {
++        s_warned[underlying(op) & 15] = true;
++        Log.warn("logic op {} drawn as COPY", underlying(op));
++      }
++      colorBlendComponent = {
++          .operation = wgpu::BlendOperation::Add,
++          .srcFactor = wgpu::BlendFactor::One,
++          .dstFactor = wgpu::BlendFactor::Zero,
++      };
++      break;
++    }
++    case GX_LO_AND:
++      colorBlendComponent = {
++          .operation = wgpu::BlendOperation::Add,
++          .srcFactor = wgpu::BlendFactor::Dst,
++          .dstFactor = wgpu::BlendFactor::Zero,
++      };
++      break;
++    case GX_LO_REVAND:  // s & ~d
++      colorBlendComponent = {
++          .operation = wgpu::BlendOperation::Add,
++          .srcFactor = wgpu::BlendFactor::OneMinusDst,
++          .dstFactor = wgpu::BlendFactor::Zero,
++      };
++      break;
++    case GX_LO_INVAND:  // ~s & d
++      colorBlendComponent = {
++          .operation = wgpu::BlendOperation::Add,
++          .srcFactor = wgpu::BlendFactor::Zero,
++          .dstFactor = wgpu::BlendFactor::OneMinusSrc,
++      };
++      break;
++    case GX_LO_XOR:
++      colorBlendComponent = {
++          .operation = wgpu::BlendOperation::Add,
++          .srcFactor = wgpu::BlendFactor::OneMinusDst,
++          .dstFactor = wgpu::BlendFactor::OneMinusSrc,
++      };
++      break;
++    case GX_LO_OR:
++      colorBlendComponent = {
++          .operation = wgpu::BlendOperation::Add,
++          .srcFactor = wgpu::BlendFactor::OneMinusDst,
++          .dstFactor = wgpu::BlendFactor::One,
++      };
++      break;
+     case GX_LO_CLEAR:
+       colorBlendComponent = {
+           .operation = wgpu::BlendOperation::Add,
