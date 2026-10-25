@@ -282,8 +282,12 @@ void toast(const std::string& text, bool error = true) {
 // Layout: design units (a 1280x720 window), the design centred in the window
 
 float g_ox = 0, g_oy = 0;
+float g_ext = 0;  // design units the window is taller than 16:9, on each side (4:3: 120): the layout stretches
 float X(float v) { return g_ox + U(v); }
 float Y(float v) { return g_oy + U(v); }
+// (the content sits a little above the middle of the extra height, the header at the top, the foot at the bottom)
+float YT(float v) { return Y(v) - U(g_ext * 0.5f); }
+float YB(float v) { return Y(v) + U(g_ext * 1.5f); }
 Mouse g_m;
 bool g_live = false;  // taking input this frame
 
@@ -925,7 +929,7 @@ void backdrop(Frame& fr) {
     dl->AddRectFilled(ImVec2(0, 0), ImVec2(fr.W, fr.H), col(kPlum, back));
     const float in = easeOut(a);
     const float sx = -(1.f - in) * fr.W * 0.6f;
-    const ImVec2 fa(-U(80) + sx, -U(80)), fb(X(1150) + sx, Y(578));
+    const ImVec2 fa(-U(80) + sx, -U(80)), fb(X(1150) + sx, YB(578));
     std::vector<ImVec2> pts;
     roundedRect(pts, fa, fb, 0, U(130), U(250), 0);
     dl->AddConvexPolyFilled(pts.data(), int(pts.size()), col(kOnline.field));
@@ -943,8 +947,8 @@ void backdrop(Frame& fr) {
                 dl->AddCircleFilled(ImVec2(rc.x + std::cos(an_) * U(392), rc.y + std::sin(an_) * U(392)), U(22), col(light, 0.22f), 20);
             }
         }
-        if (!artRing(dl, gameart::Art::Gear, ImVec2(X(60) + sx, Y(600)), U(300), col(light, 0.22f), -spin * 1.3f))
-            dl->AddCircle(ImVec2(X(60) + sx, Y(600)), U(260), col(light, 0.2f), 80, U(26));
+        if (!artRing(dl, gameart::Art::Gear, ImVec2(X(60) + sx, YB(600)), U(300), col(light, 0.22f), -spin * 1.3f))
+            dl->AddCircle(ImVec2(X(60) + sx, YB(600)), U(260), col(light, 0.2f), 80, U(26));
         // meridians of a faint big globe behind everything
         for (int k = 0; k < 5; k++) {
             const float ph = std::fmod(fr.now * 0.05f + float(k) * kPi / 5.f, kPi);
@@ -958,7 +962,7 @@ void backdrop(Frame& fr) {
         }
         for (int i = 0; i < 30; i++) {
             const float x = X(0) + sx + std::fmod(float(i) * U(173.3f) + U(40), U(1150));
-            const float y = Y(0) + std::fmod(float(i * i) * U(41.7f) + U(30), U(560));
+            const float y = YT(0) + std::fmod(float(i * i) * U(41.7f) + U(30), U(560 + 2 * g_ext));  // (over the whole field)
             const float r = U(5 + (i % 3) * 3);
             const ImVec2 q[4] = {ImVec2(x, y - r), ImVec2(x + r, y), ImVec2(x, y + r), ImVec2(x - r, y)};
             dl->AddConvexPolyFilled(q, 4, col(light, 0.28f));
@@ -967,12 +971,12 @@ void backdrop(Frame& fr) {
     dl->PopClipRect();
     maskCorners(dl, fa, fb, 0, U(130), U(250), 0, col(kPlum, back));
     // the strip along the bottom
-    dl->AddRectFilled(ImVec2(0, Y(684)), ImVec2(fr.W, fr.H), col(kDeepPlum, back));
+    dl->AddRectFilled(ImVec2(0, YB(684)), ImVec2(fr.W, fr.H), col(kDeepPlum, back));
 }
 
 void title(Frame& fr, const std::string& name) {
     ImDrawList* dl = fr.dl;
-    const float size = U(26), ty = Y(93);
+    const float size = U(26), ty = YT(93);
     const float x = X(205) - (1.f - easeOut(fr.appear)) * U(300);
     const float tw = gameMeasure(g_font.bold, size, name.c_str());
     const float base = ty + U(17), high = ty - U(3), w = U(3.5f);
@@ -1014,7 +1018,7 @@ void statusChip(Frame& fr) {
     }
     const float size = U(17), tw = gameMeasure(g_font.bold, size, t.c_str());
     const float h = U(34), right = X(1248), w = tw + U(46) + (s.busy ? U(24) : 0.f);
-    const ImVec2 a(right - w, Y(18) - (1.f - easeOut(fr.appear)) * U(80)), b(right, a.y + h);
+    const ImVec2 a(right - w, YT(18) - (1.f - easeOut(fr.appear)) * U(80)), b(right, a.y + h);
     dl->AddRectFilled(ImVec2(a.x - U(2), a.y - U(2)), ImVec2(b.x + U(2), b.y + U(2)), col(kPlumLight), h);
     dl->AddRectFilled(a, b, col(0x221E2A), h);
     const float cy = a.y + h * 0.5f;
@@ -1025,7 +1029,7 @@ void statusChip(Frame& fr) {
 
 void band(Frame& fr) {
     ImDrawList* dl = fr.dl;
-    const float bx0 = X(275), bx1 = X(1075), bcy = Y(626), bh = U(54);
+    const float bx0 = X(275), bx1 = X(1075), bcy = YB(626), bh = U(54);
     const float dy = (1.f - easeOut(fr.appear)) * U(120);
     dl->AddRectFilled(ImVec2(bx0, bcy - bh * 0.5f + dy), ImVec2(bx1, bcy + bh * 0.5f + dy), col(kBand, 0.97f), bh * 0.5f);
     float ts = U(23);
@@ -1035,7 +1039,7 @@ void band(Frame& fr) {
     gameText(dl, g_font.text, ts, bx0 + U(30), bcy + dy, col(kBandText), fr.help.c_str());
     // the buttons, along the strip at the foot
     float hx = X(1250);
-    const float hy = Y(703), hs = U(15);
+    const float hy = YB(703), hs = U(15);
     for (int i = int(fr.hints.size()) - 1; i >= 0; i--) {
         const auto [button, what] = fr.hints[i];
         hx -= gameMeasure(g_font.text, hs, what);
@@ -1401,7 +1405,7 @@ void screenLobby(Frame& fr) {
     };
     // ---- the players (column 0): this match's (in console order during one), then those waiting ----
     {
-        const ImVec2 a(X(110) + fr.slide, Y(156)), b(X(430) + fr.slide, Y(566));
+        const ImVec2 a(X(110) + fr.slide, Y(156)), b(X(430) + fr.slide, Y(566 + g_ext));  // (taller in 4:3)
         char head[48];
         std::snprintf(head, sizeof head, "Players  %d/%d", playersIn(), L.maxPlayers);
         panel(a, b, head);
@@ -1469,7 +1473,7 @@ void screenLobby(Frame& fr) {
     }
     // ---- the session and the game settings (column 1) ----
     {
-        const ImVec2 a(X(450) + fr.slide, Y(156)), b(X(860) + fr.slide, Y(566));
+        const ImVec2 a(X(450) + fr.slide, Y(156)), b(X(860) + fr.slide, Y(566 + g_ext));  // (taller in 4:3)
         panel(a, b, "Next Match");
         const float ax0 = a.x + U(16), ax1 = b.x - U(16);
         float y = a.y + U(42);
@@ -1617,7 +1621,7 @@ void screenLobby(Frame& fr) {
     }
     // ---- chat (column 2) ----
     {
-        const ImVec2 a(X(880) + fr.slide, Y(156)), b(X(1250) + fr.slide, Y(566));
+        const ImVec2 a(X(880) + fr.slide, Y(156)), b(X(1250) + fr.slide, Y(566 + g_ext));  // (taller in 4:3)
         panel(a, b, "Chat");
         const float lx0 = a.x + U(14), lx1 = b.x - U(14), ly0 = a.y + U(40), ly1 = b.y - U(56);
         const float size = U(16), lineH = size * 1.2f;
@@ -1867,7 +1871,7 @@ void drawOsk(Frame& fr, u32 nav) {
     dl->AddRectFilled(ImVec2(0, 0), ImVec2(fr.W, fr.H), col(0x0E0B14, 0.45f * in));
     const float kw = U(58), kh = U(50), gap = U(6);
     const float w = kOskCols * (kw + gap) - gap + U(48), h = U(84) + 5 * (kh + gap) + U(20);
-    const ImVec2 a(fr.W * 0.5f - w * 0.5f, Y(700) - h + (1.f - in) * U(300)), b(a.x + w, a.y + h);
+    const ImVec2 a(fr.W * 0.5f - w * 0.5f, YB(700) - h + (1.f - in) * U(300)), b(a.x + w, a.y + h);
     dl->AddRectFilled(ImVec2(a.x - U(3), a.y - U(3)), ImVec2(b.x + U(3), b.y + U(3)), col(kPlumLight), U(26));
     dl->AddRectFilled(a, b, col(kPlum), U(24));
     // the field, at the top
@@ -1926,7 +1930,7 @@ void drawOsk(Frame& fr, u32 nav) {
 
 void drawToasts(Frame& fr) {
     ImDrawList* dl = fr.dl;
-    float y = Y(14);
+    float y = YT(14);
     for (size_t i = 0; i < g.toasts.size();) {
         const Toast& t = g.toasts[i];
         const float age = float(fr.now - t.at), life = 5.f;
@@ -2529,6 +2533,8 @@ void overlay(bool headless) {
     g_s = std::max(0.5f, std::min(io.DisplaySize.x / 1280.f, io.DisplaySize.y / 720.f));
     g_ox = std::floor((io.DisplaySize.x - 1280.f * g_s) * 0.5f);
     g_oy = std::floor((io.DisplaySize.y - 720.f * g_s) * 0.5f);
+    g_ext = std::max(0.f, g_oy / g_s);
+    g_oy -= std::floor(U(g_ext * 0.5f));
     g_m = Mouse{io.MousePos, io.MouseDelta.x != 0 || io.MouseDelta.y != 0, io.MouseClicked[0], io.MouseDown[0], io.MouseReleased[0],
                 io.MouseWheel};
     // (drawn behind the F1 menu: its list comes first)
