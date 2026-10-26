@@ -5,8 +5,9 @@ PowerPC code is translated to C++ ahead of time and runs natively, with its own 
 hardware. No emulator.
 
 **Nothing of the game is included: neither its data nor its code, translated or not.** You need your own copy of the
-game (a USA disc image). The recompiler turns the program on your disc into C++ on your computer, and the game reads
-everything else from the disc as it plays.
+game (a USA disc image). The first time you run it, the program builds the game from the program on your disc - the
+recompiler turns it into C++ and a bundled compiler compiles it, on your computer, in a few minutes - and the game
+reads everything else from the disc as it plays.
 
 ![City Trial in 16:9](docs/images/16x9_city1.jpg)
 
@@ -65,37 +66,52 @@ everything else from the disc as it plays.
   <img src="docs/images/badge_6th.jpg" width="49%" alt="A race with 8 riders: 6th place">
 </p>
 
-## Building and playing
+## Playing
 
-There is no ready-made download of the game yet (a launcher that builds it from your disc, like
-[Sonic Adventure 2 Battle: Recompiled](https://github.com/sonsegajp/Sonic-Adventure-2-Battle-Recompiled)'s, is
-planned). To build it yourself on Windows you need:
+1. Download `KirbyAirRideRecompiled-<version>-windows-x64.zip` from the
+   [releases](https://github.com/sonsegajp/Kirby-Air-Ride-Recompiled/releases) and unzip it to a folder of your own
+   (Documents, Desktop - not Program Files).
+2. Run `kirbyairride.exe` and choose your Kirby Air Ride disc image (USA, `GKYE01`: `.iso`, `.gcm`, `.ciso`, `.rvz`
+   or `.wia`), or drop it on the window.
+3. The first time, it builds the game from your disc: it checks the program on it, recompiles it to C++ and compiles
+   that with the bundled clang (`tools\llvm`, the official LLVM 19.1.5). A few minutes, once; then the game starts.
 
-- Visual Studio 2022 with **C++ desktop development** and **C++ Clang tools** (clang-cl, CMake and Ninja come with it),
-- Python 3.10 or newer,
-- your Kirby Air Ride disc image (USA: `.iso`, `.gcm`, `.ciso`, `.rvz` or `.wia`).
+![The setup screen](docs/images/setup.png)
 
-```powershell
-git clone --recursive https://github.com/sonsegajp/Kirby-Air-Ride-Recompiled.git
-cd Kirby-Air-Ride-Recompiled
-python tools\extract.py "<your disc image>" orig                      # the program, from your disc (git ignores orig\)
-powershell -File tools\build.ps1 -Target sa2recompile                  # the recompiler
-build\windows-clang\sa2recompile.exe --dol orig\main.dol --rels orig\rel --names config\GKYE01\names.txt --out build\gen
-powershell -File tools\build.ps1 -Target kirbyairride                  # the game: runtime + the recompiled program
-Play.bat                                                               # asks for your disc image the first time
-```
+**8 players online:** run `Kirby Air Ride (8 players).bat` (the program with `--8p`); the first time it builds the
+8-rider build too. For 8-player online every player in the lobby uses it, and the host sets **Match Players** above 4
+(City Trial).
 
-Nothing generated from your disc ever enters the repository (`orig\` and `build\` are ignored). The 8-rider build is
-made the same way with `tools\build8p.ps1` (into `build\8p-agent`); for 8-player online every player uses it, and the
-host sets **Match Players** above 4 (City Trial).
-
-**Online:** a build made from this repository has no official service built in (its address is set when building:
-`-DKAR_ONLINE_MASTER=host:port`, or `online_master.txt`). Use a dedicated server: in the game, **Online > Settings >
-Service: Dedicated Server**, then its address.
+The disc setup checks for: the USA release's `main.dol`, 5,514,016 bytes, SHA-1
+`977533bb96e6a16e127946396489be1b4164ac42` (any image format, trimmed or not). Setup's steps, the compiler's command
+lines and how the pieces fit: [docs/SETUP.md](docs/SETUP.md).
 
 **Controls:** a controller works directly (recommended); the keyboard too. F1: settings. F11: full screen. Saves go
 to `saves\MemoryCardA.raw` (a GameCube memory card image, the same format as Dolphin's); settings to
 `kirbyairride-settings.ini`.
+
+## Building from source
+
+On Windows you need Visual Studio 2022 with **C++ desktop development** and **C++ Clang tools** (clang-cl, CMake and
+Ninja come with it), Python 3.10 or newer, and your disc image.
+
+```powershell
+git clone --recursive https://github.com/sonsegajp/Kirby-Air-Ride-Recompiled.git
+cd Kirby-Air-Ride-Recompiled
+powershell -File tools\build.ps1 -Target kirbyairride                  # the program (the runtime and setup)
+```
+
+The program then builds the game itself the first time it runs, as the download does - with `build\windows-clang\tools\llvm`
+holding clang.exe and lld-link.exe (LLVM 19.1.5). Or, for working on the game: extract the program
+(`python tools\extract.py "<disc image>" orig`), recompile it (`sa2recompile --dol orig\main.dol --rels orig\rel
+--names config\GKYE01\names.txt --out build\gen`) and build the CMake target `kirbyairride_game` - the developer build
+of the game module, beside the program (`tools\build8p.ps1`: the 8-rider build's). `Play.bat` plays it. Nothing
+generated from your disc ever enters the repository (`orig\` and `build\` are ignored); `tools\package.ps1` makes the
+download, with no game code in it.
+
+**Online:** a build made from this repository has no official service built in (its address is set when building:
+`-DKAR_ONLINE_MASTER=host:port`, or `online_master.txt`). Use a dedicated server: in the game, **Online > Settings >
+Service: Dedicated Server**, then its address.
 
 ## Running a dedicated server
 

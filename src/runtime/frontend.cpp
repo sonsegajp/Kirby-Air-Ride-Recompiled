@@ -406,6 +406,8 @@ void padSnapshot(u8 out[4][12]) {
     std::memcpy(out, s_padGuest, sizeof s_padGuest);
 }
 
+bool (*g_beforeGame)() = nullptr;
+
 int runFrontend(int argc, char** argv, bool headless, u64 maxFrames, void (*startGuest)()) {
     if (headless) _putenv("AURORA_HEADLESS=1");
     // Widescreen (default): the window's aspect, with the 3D views widened and the HUD kept at its
@@ -491,6 +493,13 @@ int runFrontend(int argc, char** argv, bool headless, u64 maxFrames, void (*star
     PADInit();
     PADSetKeyboardActive(0, TRUE);
     pollPads();
+    // First-run setup (the setup screen) and what needs the game's code, before the game starts.
+    if (g_beforeGame && !g_beforeGame()) {
+        log("[frontend] closed before the game started\n");
+        aurora_pipeline_cache_clean_exit();
+        std::fflush(stdout);
+        std::_Exit(0);
+    }
     log("[frontend] controllers ready; starting the game\n");
     std::thread(startGuest).detach();
 

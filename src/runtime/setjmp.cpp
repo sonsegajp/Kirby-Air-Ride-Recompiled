@@ -21,7 +21,7 @@ struct HostJmp {
 thread_local std::unordered_map<u32, std::unique_ptr<HostJmp>> t_jmps;  // by guest jmp_buf address
 }  // namespace
 
-jmp_buf* guestJmpBuf(u32 env) {
+void* guestJmpBuf(u32 env) {  // (a jmp_buf: the game module sees the C runtime's type by another name)
     auto& j = t_jmps[env];
     if (!j) j = std::make_unique<HostJmp>();
     return &j->buf;

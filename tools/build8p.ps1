@@ -14,10 +14,11 @@ if (-not $NoGen) {
 }
 if (-not (Test-Path build/8p-agent/build.ninja)) {
     cmake -S . -B build/8p-agent -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl `
-        "-DSA2_GEN_DIR=$root/build/gen-8p"
+        "-DSA2_GEN_DIR=$root/build/gen-8p" -DKAR_GAME_8P=ON
     if ($LASTEXITCODE) { Pop-Location; exit $LASTEXITCODE }
 }
-cmake --build build/8p-agent --target kirbyairride
+cmake -S . -B build/8p-agent -DKAR_GAME_8P=ON | Out-Null
+cmake --build build/8p-agent --target kirbyairride kirbyairride_game
 $code = $LASTEXITCODE
 Pop-Location
 exit $code

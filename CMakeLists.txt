@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(kirbyairriderecomp LANGUAGES C CXX VERSION 0.1)
+project(kirbyairriderecomp LANGUAGES C CXX VERSION 1.2.0)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -63,38 +63,63 @@ add_library(disc STATIC src/disc/discimage.cpp)
 target_include_directories(disc PUBLIC src)
 target_link_libraries(disc PRIVATE zstd::libzstd)
 
-# ---- Developer build: runtime + the game recompiled at build time (kirbyairride) -----------------
+# ---- The program (kirbyairride): the runtime. The game's code is not in it: it loads kirbyairride_game.dll,
+# which first-run setup builds from the player's own disc (src/setup; never shipped). It exports what that code
+# calls (RT_API in src/runtime/ctx.h: kirbyairride.lib) and forwards the C runtime's _setjmp to it.
+file(GLOB RUNTIME_SOURCES CONFIGURE_DEPENDS src/runtime/*.cpp)
+# SA2_EXTRA_SOURCES: work in progress kept out of the glob (docs/MORE_PLAYERS.md), added by a build tree's cache.
+set(SA2_EXTRA_SOURCES "" CACHE STRING "Extra runtime sources (not globbed)")
+# What first-run setup compiles the module with (src/runtime/setup.cpp) is embedded in the program.
+set(_embed_out ${CMAKE_BINARY_DIR}/generated/setup_files.inc)
+add_custom_command(OUTPUT ${_embed_out}
+    COMMAND ${CMAKE_COMMAND} -DOUT=${_embed_out} -DROOT=${CMAKE_SOURCE_DIR} -P ${CMAKE_SOURCE_DIR}/tools/embed.cmake
+    DEPENDS tools/embed.cmake src/runtime/ctx.h src/runtime/modules.h src/runtime/abi.h src/game/glue.cpp
+            config/GKYE01/names.txt config/GKYE01/patches_8p.txt
+    COMMENT "Embedding the game module's sources in the program")
+add_executable(kirbyairride ${RUNTIME_SOURCES} ${SA2_EXTRA_SOURCES} ${_embed_out})
+target_include_directories(kirbyairride PRIVATE src ${CMAKE_BINARY_DIR}/generated)
+set_target_properties(kirbyairride PROPERTIES ENABLE_EXPORTS ON)
+target_compile_options(kirbyairride PRIVATE /EHsc)
+target_link_options(kirbyairride PRIVATE "/EXPORT:_setjmp=VCRUNTIME140.__intrinsic_setjmp")
+target_link_libraries(kirbyairride PRIVATE disc sa2_recompiler aurora::core aurora::gx aurora::vi aurora::pad aurora::mtx)
+# (the version a module built by setup is stamped with: a new version builds it again)
+set_property(SOURCE src/runtime/setup.cpp APPEND PROPERTY COMPILE_DEFINITIONS "KAR_VERSION=\"${PROJECT_VERSION}\"")
+# The GX bridge feeds Aurora's command FIFO directly (internal headers).
+target_include_directories(kirbyairride PRIVATE ${CMAKE_SOURCE_DIR}/extern/aurora/lib)
+if (WIN32)
+    add_custom_command(TARGET kirbyairride POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:kirbyairride> $<TARGET_FILE_DIR:kirbyairride>
+        COMMAND_EXPAND_LISTS)
+    # Dawn's D3D12 backend loads the shader compiler DLLs at run time.
+    file(GLOB _dawn_dx_dlls "${CMAKE_BINARY_DIR}/_deps/dawn_prebuilt-src/bin/dx*.dll")
+    if (_dawn_dx_dlls)
+        add_custom_command(TARGET kirbyairride POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_dawn_dx_dlls} $<TARGET_FILE_DIR:kirbyairride>)
+    endif ()
+endif ()
+
+# ---- Developer build of the game module (kirbyairride_game.dll) from the recompiler's output -------------
 # Generate with: sa2recompile --dol orig/main.dol --rels orig/rel --names config/GKYE01/names.txt
-#                --out build/gen      (nothing generated is ever committed)
+#                --out build/gen      (nothing generated is ever committed; the 8-rider build: tools/build8p.ps1)
 set(SA2_GEN_DIR "${CMAKE_SOURCE_DIR}/build/gen" CACHE PATH "Recompiler output for the developer build")
+option(KAR_GAME_8P "The developer build's module is the 8-rider build's (kirbyairride_game_8p.dll)" OFF)
 file(GLOB SA2_GEN_SOURCES CONFIGURE_DEPENDS ${SA2_GEN_DIR}/*.cpp)
 if (SA2_GEN_SOURCES)
-    file(GLOB RUNTIME_SOURCES CONFIGURE_DEPENDS src/runtime/*.cpp)
-    # SA2_EXTRA_SOURCES: work in progress kept out of the glob (docs/MORE_PLAYERS.md), added by a build tree's cache.
-    set(SA2_EXTRA_SOURCES "" CACHE STRING "Extra runtime sources (not globbed)")
-    add_executable(kirbyairride ${RUNTIME_SOURCES} ${SA2_GEN_SOURCES} ${SA2_EXTRA_SOURCES})
-    target_include_directories(kirbyairride PRIVATE src ${SA2_GEN_DIR})
-    # Generated code: one big function per guest function with gotos; no debug info (it is huge),
-    # unwind tables so a guest thread can end by unwinding through it.
-    set_source_files_properties(${SA2_GEN_SOURCES} PROPERTIES COMPILE_OPTIONS
-        "/O2;/clang:-g0;/clang:-funwind-tables;-Wno-unused-label;-Wno-unused-variable;-Wno-unused-but-set-variable")
-    target_compile_options(kirbyairride PRIVATE /EHsc)
-    target_link_libraries(kirbyairride PRIVATE disc aurora::core aurora::gx aurora::vi aurora::pad aurora::mtx)
-    # The GX bridge feeds Aurora's command FIFO directly (internal headers).
-    target_include_directories(kirbyairride PRIVATE ${CMAKE_SOURCE_DIR}/extern/aurora/lib)
-    if (WIN32)
-        add_custom_command(TARGET kirbyairride POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:kirbyairride> $<TARGET_FILE_DIR:kirbyairride>
-            COMMAND_EXPAND_LISTS)
-        # Dawn's D3D12 backend loads the shader compiler DLLs at run time.
-        file(GLOB _dawn_dx_dlls "${CMAKE_BINARY_DIR}/_deps/dawn_prebuilt-src/bin/dx*.dll")
-        if (_dawn_dx_dlls)
-            add_custom_command(TARGET kirbyairride POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_dawn_dx_dlls} $<TARGET_FILE_DIR:kirbyairride>)
-        endif ()
+    add_library(kirbyairride_game SHARED ${SA2_GEN_SOURCES} src/game/glue.cpp)
+    if (KAR_GAME_8P)
+        set_target_properties(kirbyairride_game PROPERTIES OUTPUT_NAME kirbyairride_game_8p)
     endif ()
+    target_include_directories(kirbyairride_game PRIVATE src ${SA2_GEN_DIR})
+    target_compile_definitions(kirbyairride_game PRIVATE KAR_GAME_DLL)
+    # Generated code: one big function per guest function with gotos; no debug info (it is huge), unwind tables
+    # so a guest thread can end by unwinding through it; no C library (as setup builds it on the player's PC).
+    target_compile_options(kirbyairride_game PRIVATE /O2 /clang:-g0 /clang:-ffreestanding /clang:-funwind-tables /GS- /Zl /GR- /EHs-c-
+        -Wno-unused-label -Wno-unused-variable -Wno-unused-but-set-variable)
+    target_link_options(kirbyairride_game PRIVATE /NOENTRY /NODEFAULTLIB)
+    target_link_libraries(kirbyairride_game PRIVATE kirbyairride)
+    set_target_properties(kirbyairride_game PROPERTIES MSVC_RUNTIME_LIBRARY "")
 else ()
-    message(STATUS "No recompiler output in ${SA2_GEN_DIR}; skipping the kirbyairride developer build")
+    message(STATUS "No recompiler output in ${SA2_GEN_DIR}; skipping the developer build of kirbyairride_game.dll")
 endif ()
 
 # ---- airnet_test: the online client (src/runtime/airnet.cpp) against a local master server -------

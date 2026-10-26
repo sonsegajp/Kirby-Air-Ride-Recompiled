@@ -189,7 +189,7 @@ private:
             // restored by the game's own longjmp - execution goes on after this call, as on the
             // console. The first time through, the game's __setjmp saves them.
             if (const Func* tf = funcAt(tmod, target); tf && tf->name == "__setjmp" && always) {
-                E("if (!setjmp(*guestJmpBuf(c.r[3]))) { " + call + "; }");
+                E("if (!setjmp(*static_cast<jmp_buf*>(guestJmpBuf(c.r[3])))) { " + call + "; }");
                 return;
             }
             E(always ? call + ";" : "if (" + cond + ") { " + call + "; }");
@@ -848,11 +848,9 @@ std::string emitFunction(const Program& p, const ModuleInfo& mi, const Func& f, 
 }
 
 const char* kPrelude =
-    "// Generated from the user's own disc by the SA2B recompiler. Never commit.\n"
+    "// Generated from the user's own disc by the recompiler. Never commit.\n"
     "#include \"runtime/ctx.h\"\n"
-    "#include <setjmp.h>\n"
-    "namespace rt {\nextern HleFn g_hooks[];\nextern u8 g_fnOverride[];\nvoid runOverride(Ctx& c, u32 slot);\n"
-    "jmp_buf* guestJmpBuf(u32 env);  // setjmp call sites (src/runtime/setjmp.cpp)\n}\n";
+    "namespace rt {\nextern HleFn g_hooks[];\nextern u8 g_fnOverride[];\n}\n";
 // Declared only where used, so adding a patch point rebuilds just the files it touches.
 const char* kPatchDecl = "namespace rt {\nusing PatchFn = bool (*)(Ctx&);\nextern PatchFn g_patchPoints[];\n}\n";
 // With --overrides / --trace-mem only: an address moved (MV_), an access or address traced (MT_).
@@ -861,7 +859,7 @@ std::string overridePrelude(const CodeOverrides& ov) {
         "namespace rt {\n"
         "static inline u32 MV_(u32 x, u32 from, u32 len, u32 to) { return x - from < len ? x - from + to : x; }\n";
     if (ov.trace)
-        s += "void memTrace(u32 pc, u32 x, u32 info);  // src/runtime/codeoverrides.cpp\n" +
+        s += "RT_API void memTrace(u32 pc, u32 x, u32 info);  // src/runtime/codeoverrides.cpp\n" +
              fmt("static inline void MT_(u32 pc, u32 x, u32 info) { if (x - 0x%08Xu < 0x%Xu) [[unlikely]] memTrace(pc, x, info); }\n",
                  ov.traceLo, ov.traceHi - ov.traceLo);
     return s + "}\n";
@@ -946,15 +944,15 @@ std::vector<OutputFile> emitProgram(const Program& p, EmitStats& st, int dolChun
         // the program starts (src/runtime/codeoverrides.cpp): it writes the words into guest memory, so the
         // interpreter (functions replaced at run time) sees the same code, and applies the moves there too.
         const CodeOverrides& ov = p.overrides;
-        if (!ov.words.empty() || !ov.moves.empty()) {
-            t += "namespace rt {\nvoid registerCodeOverrides(const u32* words, u32 wordCount, const u32* moves, u32 moveCount);\n";
-            t += "static const u32 kOverrideWords[] = {\n";
+        // (Always there, empty without overrides: the game module hands them over - src/game/glue.cpp.)
+        {
+            t += "namespace rt {\nextern const u32 kOverrideWords[] = {\n";
             for (auto& [a, w] : ov.words) t += fmt("    0x%08Xu, 0x%08Xu,\n", a, w);
-            t += "    0, 0};\nstatic const u32 kOverrideMoves[] = {\n";
+            t += "    0, 0};\nextern const u32 kOverrideMoves[] = {\n";
             size_t nm = 0;
             for (auto& [a, ms] : ov.moves)
                 for (const AddrMove& m : ms) t += fmt("    0x%08Xu, 0x%08Xu, 0x%Xu, 0x%08Xu,\n", a, m.from, m.len, m.to), nm++;
-            t += fmt("    0, 0, 0, 0};\nstatic const int kOverridesRegistered = (registerCodeOverrides(kOverrideWords, %zuu, kOverrideMoves, %zuu), 0);\n}\n",
+            t += fmt("    0, 0, 0, 0};\nextern const u32 kOverrideWordCount = %zuu;\nextern const u32 kOverrideMoveCount = %zuu;\n}\n",
                      ov.words.size(), nm);
         }
         files.push_back({"dol_table.cpp", std::move(t)});

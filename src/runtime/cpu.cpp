@@ -18,8 +18,6 @@
 
 namespace rt {
 
-volatile u32 g_irqPending = 0;
-bool g_traceOn = false;
 
 // ---- logging ----
 static std::mutex s_logLock;
@@ -196,6 +194,8 @@ u64 timebase() {
 }
 u32 Ctx::timebaseLo() { return u32(timebase()); }
 u32 Ctx::timebaseHi() { return u32(timebase() >> 32); }
+
+double hostFma(double a, double b, double c) { return std::fma(a, b, c); }
 
 // ---- paired-single quantization (GQR: load type 16-18, load scale 24-29, store type 0-2,
 // store scale 8-13; types 0 float, 4 u8, 5 u16, 6 s8, 7 s16; scale is 6-bit signed) ----

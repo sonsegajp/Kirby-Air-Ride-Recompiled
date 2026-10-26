@@ -7,7 +7,6 @@
 namespace rt {
 
 u8* g_mem = nullptr;
-u32 g_relBase[256][32];
 
 bool memInit() {
     g_mem = static_cast<u8*>(std::calloc(kHostMemSize, 1));

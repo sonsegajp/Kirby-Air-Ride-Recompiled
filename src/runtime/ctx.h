@@ -8,6 +8,28 @@
 //
 // FREESTANDING: the generated game module is compiled with this header alone (no C/C++ library
 // headers): builtins only. Everything not inline here comes from the runtime.
+//
+// The game module is a DLL (kirbyairride_game.dll) built on the player's machine from their own disc - no
+// translated game code ships. It is compiled with KAR_GAME_DLL: it imports the runtime functions below from
+// kirbyairride.exe (RT_API) and owns the state its code touches all the time (the guest memory base copy,
+// the interrupt flag, REL bases: plain globals there); the runtime reaches that state through pointers set
+// when it loads the module (src/runtime/game.cpp).
+#if defined(KAR_GAME_DLL)
+#define RT_API __declspec(dllimport)
+// setjmp for the game's __setjmp call sites (src/recompiler/emit.cpp), with no C library headers: the C
+// runtime's own (the program forwards it as _setjmp: CMakeLists.txt). Freestanding code gets no builtin
+// setjmp, so the call is spelled out as the compiler's builtin makes it: the frame it returns to, for
+// longjmp's unwind, in the second argument.
+struct alignas(16) KarJmpPart {
+    unsigned long long part[2];
+};
+typedef KarJmpPart jmp_buf[16];
+extern "C" __declspec(dllimport) __attribute__((returns_twice)) int __cdecl _setjmp(jmp_buf, void* frame);
+#define setjmp(buf) _setjmp(buf, __builtin_frame_address(0))
+#else
+#define RT_API __declspec(dllexport)
+#endif
+
 namespace rt {
 
 using u8 = __UINT8_TYPE__;
@@ -26,18 +48,27 @@ constexpr u32 kLockedCache = 0x01800000;  // host offset of the 16 KiB locked ca
 constexpr u32 kHostMemSize = 0x02000000;
 constexpr u32 kHostMemMask = kHostMemSize - 1;
 
-extern u8* g_mem;
+extern u8* g_mem;  // (each side has its own copy of the base: it never changes once allocated)
+#if defined(KAR_GAME_DLL)
 extern volatile u32 g_irqPending;  // nonzero when an interrupt waits for a safe point
 extern bool g_traceOn;
-// Load bases of REL sections, set by OSLink: [module id][section] (src/runtime/modules.cpp).
+// Load bases of REL sections, set by OSLink: [module id][section].
 extern u32 g_relBase[256][32];
+#else
+extern volatile u32* g_irqPendingPtr;
+extern bool* g_traceOnPtr;
+extern u32 (*g_relBasePtr)[32];
+#define g_irqPending (*::rt::g_irqPendingPtr)
+#define g_traceOn (*::rt::g_traceOnPtr)
+#define g_relBase g_relBasePtr  // (unqualified: rt::g_relBase is written too)
+#endif
 
 inline u8* hostp(u32 a) {
     return g_mem + ((a >> 28) == 0xE ? (kLockedCache | (a & 0x3FFF)) : (a & kHostMemMask));
 }
 inline bool is_mmio(u32 a) { return (a >> 24) == 0xCC; }
-u32 mmio_rd(u32 a, int size);
-void mmio_wr(u32 a, u32 v, int size);
+RT_API u32 mmio_rd(u32 a, int size);
+RT_API void mmio_wr(u32 a, u32 v, int size);
 
 inline u32 bswap32(u32 v) { return __builtin_bswap32(v); }
 inline u16 bswap16(u16 v) { return __builtin_bswap16(v); }
@@ -88,11 +119,18 @@ inline void wrf64(u32 a, double v) {
 struct Ctx;
 using GuestFn = void (*)(Ctx&);
 using HleFn = void (*)(Ctx&);
-HleFn hleLookup(const char* name);
-void hleMissing(const char* name, u32 addr, Ctx& c);
-void service_irq(Ctx& c);
-void trace_enter(u32 addr, Ctx& c);
-[[noreturn]] void fatal(const char* fmt, ...);
+RT_API HleFn hleLookup(const char* name);
+RT_API void hleMissing(const char* name, u32 addr, Ctx& c);
+RT_API void service_irq(Ctx& c);
+RT_API void trace_enter(u32 addr, Ctx& c);
+[[noreturn]] RT_API void fatal(const char* fmt, ...);
+// Run-time replacement of any function: when g_fnOverride[slot] is set, the function calls
+// runOverride instead of running its translated body (src/runtime/interp.cpp).
+RT_API void runOverride(Ctx& c, u32 slot);
+// fma for __builtin_fma (fmadd and friends) in the module, which has no C library of its own.
+RT_API double hostFma(double a, double b, double c);
+// The host jmp_buf of a guest one, for the game's setjmp call sites (src/runtime/setjmp.cpp).
+RT_API void* guestJmpBuf(u32 env);
 
 struct Ctx {
     u32 r[32]{};
@@ -187,8 +225,8 @@ struct Ctx {
     static double fsel(double a, double c, double b) { return a >= 0.0 ? c : b; }
 
     // Paired-single quantized load/store through GQR[i] (src/runtime/cpu.cpp).
-    void psqLoad(int d, u32 ea, bool w, int i);
-    void psqStore(int s, u32 ea, bool w, int i);
+    RT_API void psqLoad(int d, u32 ea, bool w, int i);
+    RT_API void psqStore(int s, u32 ea, bool w, int i);
 
     // --- control ---
     void enter(u32 addr) {
@@ -197,17 +235,17 @@ struct Ctx {
     void poll() {
         if (g_irqPending) [[unlikely]] service_irq(*this);
     }
-    void call(u32 addr);  // indirect call: dispatch table lookup (src/runtime/dispatch.cpp)
-    [[noreturn]] void unimplemented(u32 pc, u32 insn);
-    void syscall();
-    void trap(u32 pc);
-    u32 timebaseLo();
-    u32 timebaseHi();
-    void mtspr(u32 n, u32 v);
-    u32 mfspr(u32 n);
-    void mtmsr(u32 v);
-    void lswi(int d, u32 ea, u32 n);
-    void stswi(int s, u32 ea, u32 n);
+    RT_API void call(u32 addr);  // indirect call: dispatch table lookup (src/runtime/dispatch.cpp)
+    [[noreturn]] RT_API void unimplemented(u32 pc, u32 insn);
+    RT_API void syscall();
+    RT_API void trap(u32 pc);
+    RT_API u32 timebaseLo();
+    RT_API u32 timebaseHi();
+    RT_API void mtspr(u32 n, u32 v);
+    RT_API u32 mfspr(u32 n);
+    RT_API void mtmsr(u32 v);
+    RT_API void lswi(int d, u32 ea, u32 n);
+    RT_API void stswi(int s, u32 ea, u32 n);
     void dcbz(u32 ea) {
         ea &= ~31u;
         if (is_mmio(ea)) return;
