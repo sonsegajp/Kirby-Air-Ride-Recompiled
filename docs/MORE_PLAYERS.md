@@ -1,8 +1,9 @@
 # 8 riders
 
-8 riders in City Trial, offline and online (one player per PC), with the HUD, the machine stats, the Stadiums and
-the results for 8. Each PC shows one rider's view, so split-screen beyond 4 isn't needed. Air Ride with more than 4
-is next. How it was done, below.
+8 players online in City Trial (one per PC), with the HUD, the machine stats, the Stadiums and the results for 8.
+Each PC shows one rider's view, so split-screen beyond 4 isn't needed. Offline the 8-rider build plays as the game
+does, up to 4 riders (`lansession.cpp` `fourRiders`: the raised setup loops' copies in slots 6-9 cleared). Air Ride
+with more than 4 is next. How it was done, below.
 
 ## The game's limits (main.dol, GKYE01)
 - **Player slots:** `Gm_Player_NumMax` is 5. Slots 0-3 are the riders; slot 4 is King Dedede in the VS. King Dedede

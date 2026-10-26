@@ -20,11 +20,11 @@ everything else from the disc as it plays.
   connections with a relay as fallback, and a lockstep netcode that hides latency. Play on the official service or
   on a **dedicated server** anyone can run ([docs/ONLINE.md](docs/ONLINE.md)).
 - **A settings menu** (F1) drawn with the game's own art: display, frame rate, in-between frames, volume.
-- **8 riders in City Trial** (the 8-rider build): start spots, the Stadiums, the HUD (places 5th-8th, the High Jump
-  and Air Glider lists), the machine stats and the results for 8 - and **8 players online**, one per PC, each with
-  their own screen and HUD, in step through the whole match. Air Ride stays at 4 for now; riders 5-8 have no name
-  label floating over them; two 8-player matches in a row in one lobby are not tested yet
-  ([docs/MORE_PLAYERS.md](docs/MORE_PLAYERS.md)).
+- **8 players online in City Trial** (the 8-rider build): one per PC, each with their own screen and HUD, in step
+  through the whole match - start spots, the Stadiums, the HUD (places 5th-8th, the High Jump and Air Glider lists),
+  the machine stats and the results for 8. Offline the build plays as the game does (up to 4 riders). Air Ride stays
+  at 4 for now; riders 5-8 have no name label floating over them; two 8-player matches in a row in one lobby are not
+  tested yet ([docs/MORE_PLAYERS.md](docs/MORE_PLAYERS.md)).
 
 ## Screenshots
 

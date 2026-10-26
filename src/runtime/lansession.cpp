@@ -434,8 +434,27 @@ void soloStart(Ctx& c) {
     log("[solo] City Trial, %d riders\n", s_solo.riders);
 }
 // Player Entry is over: riders 2.. are CPUs (copies of player 1's entry: another color, a CPU level).
+// Offline (and the game's own LAN menus) in the 8-player build: 4 riders, as the game - its setup loops, raised to
+// 10, leave copies in slots 6-9 (a CPU, a "human" on pad 8 with a screen: a split screen for one player).
+void fourRiders(Ctx& c) {
+    for (u32 slot = 6; slot < 10; slot++) {
+        wr8(morepl::plyDesc(slot), 4);  // (no one)
+        wr8(morepl::at(morepl::k_view_desc, slot) + 1, 0);
+    }
+    int riders = 0;
+    for (u32 slot = 0; slot < 4; slot++) riders += rd8(morepl::plyDesc(slot)) != 4 ? 1 : 0;
+    guestCall(c, kSetRiderCount, {u32(riders)});
+    log("[lansession] offline: %d riders, as the game (slots 6-9 cleared)\n", riders);
+}
+bool ourMatch() { return (lan::sessionPcs() > 0 && s_phase == Phase::InMatch) || s_solo.inMatch; }
+constexpr u32 kArSetup = 0x80020638;  // the other setup that counts the riders (Air Ride's, from 80026F20 / 80027FA4)
+void arSetup(Ctx& c, u32 entry) {
+    interpOriginal(c, entry);
+    if (morepl::active() && !ourMatch()) fourRiders(c);
+}
 void ctSetup(Ctx& c, u32 entry) {
     interpOriginal(c, entry);
+    if (morepl::active() && !ourMatch()) return fourRiders(c);
     if (s_trace) {  // (SA2_LAN_SESSION_TRACE: the players the game entered, and their views)
         for (u32 slot = 0; slot < morepl::count(morepl::k_ply_desc); slot++) {
             char b[200];
@@ -921,7 +940,7 @@ void install() {
               interpReplace(0, kArEntryFrame, arEntryFrame) && interpReplace(0, kCtEntryFrame, ctEntryFrame) &&
               interpReplace(0, kStatsFrame, statsFrame) && interpReplace(0, kArResultsFrame, resultsFrame) &&
               interpReplace(0, kCtResultsFrame, resultsFrame) && interpReplace(0, kPadRead, padRead) &&
-              interpReplace(0, kCtSetup, ctSetup);
+              interpReplace(0, kCtSetup, ctSetup) && interpReplace(0, kArSetup, arSetup);
     if (!ok) return log("[lansession] the game's functions are not where expected - no LAN sessions\n");
     if (rd32(kLanViews) == 0x9421FFF0) interpReplace(0, kLanViews, lanViews);
     s_installed = true;
