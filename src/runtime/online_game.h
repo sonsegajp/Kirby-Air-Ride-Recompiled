@@ -26,7 +26,7 @@ const char* whereName(Where w);
 
 // ---- a match ----
 struct Start {
-    int consoles = 0;   // 2..4
+    int consoles = 0;   // 2..4 (2..8 in the 8-player build)
     int me = -1;        // this console's number, 0..consoles-1
     uint32_t seed = 0;
     int64_t startAtMs = 0;  // (airnet's clock)

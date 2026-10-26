@@ -21,7 +21,8 @@ DEFAULT_UDP_PORT = 27601
 # ---- limits ---------------------------------------------------------------------------------------
 MAX_LINE = 8192             # one control message, bytes
 LOBBY_MAX_MEMBERS = 16      # people in one hosted server
-MATCH_MAX_PLAYERS = 4       # consoles in one match: the game's LAN limit (per server; may rise later)
+MATCH_MAX_PLAYERS = 8       # consoles in one match (the 8-player build; the game's own LAN takes 4)
+MATCH_DEFAULT_PLAYERS = 4   # a server's when its host names none
 SETTINGS_MAX = 4096         # the host's game settings, as JSON, bytes
 RESULTS_MAX = 2048          # a match result a client reports, as JSON, bytes
 CANDIDATES_MAX = 8          # addresses a client offers for peer-to-peer

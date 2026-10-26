@@ -121,6 +121,47 @@ split-screen beyond 4 isn't needed.
 - **Still 4-only:** the time-up flag (an unrolled block marks slots 0-3 out when time runs out; the results screen
   ranks for itself, so only the HUD of riders 6-9 is affected).
 
+## Online with 8 (2026-10-25, later)
+- **Seats** (`src/runtime/lan.h`): the game's LAN mode knows 4 consoles, its input token 4 slots of 4 controller ports.
+  PCs 0-3 are consoles 0-3 (port 0); PCs 4-7 sit on spare ports - console 0's ports 2, 3, 1 and console 1's port
+  1, the raw network pads 6, 7, 5 and 9. Riders read the pad of their controller index (ply_desc +6, player +0x8D),
+  so riders 6, 7, 8, 9 are given exactly those pads and need no other input path.
+- **Connecting** (`lansync.cpp` `connect`, replacing the net library's 804876A0): every PC knows the lobby's order,
+  so the console list (count, place, ring neighbours, an address each) is filled in at once - no SSDP handshake,
+  which could never take 8.
+- **The lockstep** (`lansync.cpp`): up to 8 peers; each round the game gets slots 0-3 from PCs 0-3 and, during a
+  stage only, PCs 4-7's controllers in their seats (in the menus a controller showing up on another port is another
+  player to wait for). The session id is the match's seed.
+- **Riders** (`lansession.cpp` `ctSetup`): Player Entry enters consoles 0-3 (each PC presses A on its own controller,
+  as a person would - the LAN Player Entry reads the input sets, not the pads afterwards); riders 6-9 are added for
+  PCs 4-7 on their seats' pads. The slots the 8-player build's raised loops left with copies (a CPU in 6, a "human"
+  on pad 8) are cleared - in 2-4 PC sessions too.
+- **Screens** (`lansession.cpp` `lanViews`, replacing f_80020188): each PC keeps the screen of the rider on its own
+  controller only. The game's version is unrolled for 4 slots and, in the 8-player build, its 2-console branch was
+  split by the relocation (writes past the views): every PC drew a split screen of all humans.
+- **The players' HUD** (3D_InitMapAndPrompt 80113150): its 12 loops over slots 0-3 raised to 10, so a PC whose rider
+  is in slots 6-9 has a speedometer, timer, place and the rest.
+- **Lobby** (`server/`, `online_menu.cpp`): matches of 2-8 (4 unless the host says); above 4, City Trial only
+  (Air Ride is not converted for 8 yet).
+- **Tests**: `scratch_kar/eight/lanN.ps1 -N <2-8>`: N copies on the loopback LAN in one session (`SA2_LAN_CHECK` seeds
+  compared); `SA2_NO_DRAW=1` (copies not rendered but for dumped frames) and `SA2_LAN_LOST_MS` let 8 run on one PC.
+
+## Online with 8 in step (2026-10-26)
+Eight PCs online through a dedicated server now play a whole City Trial match in step - the city, the machine stats,
+the Stadium and the results (two full matches, eight copies on one PC, every 120 rounds compared). What parted them:
+- **Rounds overwritten** (`lansync.cpp`): a PC made a round of its own every retrace even while its game was loading
+  and took none; past 512 (`kHistory`) those overwrote rounds it had not queued yet, and it ran on other input. Now
+  a PC makes at most `kMaxAhead` (90) rounds past its queue - the others wait for one that is loading, as the game's
+  own ring would - keeps sending meanwhile, and a console counts as lost only when nothing at all is heard from it.
+- **Disc reads** (`hle_dvd.cpp`): a read ended when this PC's disc image had it, so the game saw files arrive in
+  different steps. In a lockstep a read's end is held until the main thread's next safe point (or until it sleeps
+  waiting for it): the same point of the game's run everywhere. Music and movie streams are left alone.
+- **Sets flushed at a scene's start** (`lansync.cpp`): a scene's loop empties the input queue as it begins (8007CBB0);
+  a set queued while the scene loaded was dropped on one PC and used on another. Sets are queued only once the loop
+  runs.
+- Also: the online menu holds the game on Select Mode (it timed out to the title under a long lobby wait); the sound
+  library's assert on a late music stream (synth.c:1590) is skipped - the music drops out instead of the game stopping.
+
 ## Status
 - [x] Scan, coverage, solo test harness
 - [ ] Player table relocated to 9 slots; slot loops raised
@@ -130,5 +171,7 @@ split-screen beyond 4 isn't needed.
 - [x] Spawn points for riders 5-8 (city: aside; stadiums: a second row)
 - [x] Results for 8 (City Trial: src/runtime/results8.cpp)
 - [x] HUD: the race place 5th-8th, the High Jump / Air Glider list for 7 opponents, the machine stats screen for 8
-- [ ] Online: virtual consoles (each PC's pad goes to net pad 4 + 4·(c mod 4) + c div 4), match setup without the
-      LAN menus
+- [x] Online: up to 8 PCs (seats on spare ports, the connection filled in, riders 6-9, a screen each, the HUD)
+- [x] Online with 8 in step through a whole City Trial match (rounds capped, disc reads and scene starts in step)
+- [ ] Two matches in a row with 8 (a rematch in the same lobby)
+- [ ] Air Ride with more than 4 riders

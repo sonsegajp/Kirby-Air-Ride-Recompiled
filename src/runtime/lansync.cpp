@@ -44,6 +44,7 @@
 #include "runtime/lan.h"
 
 #include "runtime/interp.h"
+#include "runtime/morepl.h"
 #include "runtime/runtime.h"
 #include "runtime/sched.h"
 
@@ -56,10 +57,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace rt {
+// The disc reads in a lockstep (src/runtime/hle_dvd.cpp).
+void dvdGateBegin();
+void dvdGateEnd();
+}  // namespace rt
 
 namespace rt::lan {
 
@@ -95,8 +103,13 @@ constexpr struct {
 // ---- the protocol ----
 constexpr u16 kEtherType = 0x88B5;  // IEEE "local experimental"
 constexpr u32 kMagic = 0x4B415273;  // "KARs"
-constexpr u8 kVersion = 3;
-constexpr int kMaxPeers = 4, kHistory = 512, kMaxEntries = 15, kRedundancy = 4;
+constexpr u8 kVersion = 4;
+constexpr int kMaxPeers = 8, kHistory = 512, kMaxEntries = 15, kRedundancy = 4;
+// Our rounds made but not yet queued for our game, at most: a PC whose game takes no sets (a loading screen) stops
+// making rounds there - the others wait for it - so no PC's rounds run more than ~2 x this past another's queue
+// (kHistory: the rounds kept, past that they are overwritten).
+constexpr int kMaxAhead = 90;
+constexpr int kGameSlots = 4;  // the consoles the game's token has room for (PCs 4-7 ride on their spare ports)
 constexpr int kHeader = 14 + 24 + kMaxPeers * 10 + 1, kEntry = 4 + 4 + kSlotSize;
 enum : u8 { kData = 1, kEnd = 2 };
 using Clock = std::chrono::steady_clock;
@@ -125,10 +138,17 @@ struct Peer {
     int delay = 0;
 };
 
+std::atomic<int> s_sessPcs{0}, s_sessMe{0};  // setSession (lansession.cpp): the PCs, this one's place
+std::atomic<uint32_t> s_sessId{0};
 std::mutex s_m;
 std::condition_variable s_cv;
 u32 s_checkEvery = 0, s_steps = 0;  // SA2_LAN_CHECK (below)
 bool s_active = false, s_endSeen = false;
+std::atomic<u32> s_lanSteps{0};  // LAN logic steps run (padRenew)
+constexpr u32 kSceneLoop = 0x80006B58, kGmSceneOverFlag = 0x805359D8 + 0x7E0;
+std::atomic<bool> s_loopReady{true};  // a scene's loop runs, past its start (sceneLoop, below): sets may be queued
+std::atomic<u32> s_mainThread{0};  // the game's main loop (the OSThread running the steps)
+std::atomic<bool> s_dvdArm{false};  // the ring started: its first logic step holds the disc reads from then on (hle_dvd.cpp)
 std::atomic<bool> s_inSteps{false};  // the game's main loop is running logic steps (runSteps)
 u32 s_session = 0;
 int s_n = 0, s_me = 0;
@@ -261,9 +281,15 @@ bool waitFor(F ready, std::chrono::milliseconds timeout) {
 
 u32 s_in = 0, s_out = 0;  // the tokens handed to the callback (guest memory)
 
+// How long a round may be missing before its console counts as gone (5 s; SA2_LAN_LOST_MS: tests on one busy PC).
+std::chrono::milliseconds lostAfter() {
+    static const int s_ms = std::getenv("SA2_LAN_LOST_MS") ? std::max(1000, std::atoi(std::getenv("SA2_LAN_LOST_MS"))) : 5000;
+    return std::chrono::milliseconds(s_ms);
+}
+
 void freshData(u8* d) {  // the data of a token the master starts: no pads, no flags
     std::memset(d, 0, kDataSize);
-    for (int j = 0; j < kMaxPeers; j++)
+    for (int j = 0; j < kGameSlots; j++)
         for (int k = 0; k < 4; k++) d[4 + j * kSlotSize + 10 + 12 * k] = 0xFF;  // PADStatus.err: no controller
 }
 
@@ -295,16 +321,26 @@ int initialD() {
 
 void ringThread(Ctx& c, u32) {
     const u32 cb = rd32(kNet + 0x94);
-    const int n = std::clamp<int>(rd8(kNet + 0x4C), 1, kMaxPeers), me = rd8(kNet + 0x4D) % kMaxPeers;
-    const bool master = rd32(kNet + 0x90) == 1;
+    // The game's consoles (at most 4) and this one's place among them; the PCs - a session of ours (setSession):
+    // up to 8, those past 4 on spare ports of the game's consoles - and this one's place among those.
+    const int consoles = std::clamp<int>(rd8(kNet + 0x4C), 1, kGameSlots), place = rd8(kNet + 0x4D) % kGameSlots;
+    const bool ours = s_sessPcs.load() > 0;
+    const int n = ours ? std::clamp(s_sessPcs.load(), 1, kMaxPeers) : consoles, me = ours ? s_sessMe.load() % kMaxPeers : place;
+    const bool master = rd32(kNet + 0x90) == 1;  // the game's master (its callback's part: place 0)
+    const bool first = me == 0;                  // ours (the start time, telling the end): PC 0
     const u32 sendMessage = guestSymbol("OSSendMessage"), receiveMessage = guestSymbol("OSReceiveMessage");
     if (!s_in) s_in = hleAlloc(kTokenSize + 4), s_out = hleAlloc(kTokenSize + 4);
-    u32 session = 2166136261u;  // the consoles' addresses: the same list on every one
-    for (u32 a = kNet + 0x3C; a < kNet + 0x3C + 4 * kMaxPeers; a++) session = (session ^ rd8(a)) * 16777619u;
-    session ^= u32(n);
+    u32 session = 2166136261u;  // the session's id, or the consoles' addresses: the same on every one
+    if (ours) {
+        session = s_sessId.load();
+    } else {
+        for (u32 a = kNet + 0x3C; a < kNet + 0x3C + 4 * kGameSlots; a++) session = (session ^ rd8(a)) * 16777619u;
+        session ^= u32(n);
+    }
     {
         std::lock_guard g(s_m);
         s_active = true, s_endSeen = false, s_session = session, s_n = n, s_me = me, s_mySlackKnown = false, s_startAt = 0;
+        s_dvdArm = true;
         for (Peer& q : s_peers) q = Peer{};
     }
     // Sync phase: everyone heard, round trips measured.
@@ -315,7 +351,7 @@ void ringThread(Ctx& c, u32) {
                 if (j != me && s_peers[j].samples < 24) return false;
             return true;
         },
-        std::chrono::milliseconds(5000));
+        std::chrono::milliseconds(ours ? 20000 : 5000));  // (ours: everyone connects at once, but loads at its own pace)
     auto rttText = [&] {  // (under s_m)
         std::string t;
         char b[64];
@@ -328,21 +364,22 @@ void ringThread(Ctx& c, u32) {
         std::lock_guard g(s_m);
         D = initialD();
         s_myDelay = D - 1;
-        log("[lansync] console %d of %d%s: round trips p50/p95 (ms)%s -> input delay %d frames (%s, %d ms)\n", me, n,
-            master ? " (master)" : "", rttText().c_str(), D - 1, heard ? "measured" : "not all heard", int(msBetween(t0, Clock::now())));
+        log("[lansync] PC %d of %d (the game's console %d of %d%s): round trips p50/p95 (ms)%s -> input delay %d frames (%s, %d ms)\n", me,
+            n, place, consoles, master ? ", master" : "", rttText().c_str(), D - 1, heard ? "measured" : "not all heard",
+            int(msBetween(t0, Clock::now())));
     }
     // All start making rounds at the same moment (the master picks it, a little ahead; the others
     // turn it into their clocks), so each console's rounds come to the others equally early.
     {
         std::lock_guard g(s_m);
-        if (master) {
+        if (first) {
             double rtt = 0;
             for (int j = 0; j < n; j++)
                 if (j != me) rtt = std::max(rtt, rttPercentile(s_peers[j], 95));
             s_startAt = (nowMs() + u32(std::max(150.0, 1.5 * rtt + 50))) | 1;
         }
     }
-    waitFor([] { return s_startAt != 0 && s32(nowMs() - s_startAt) >= -20; }, std::chrono::milliseconds(3000));
+    waitFor([] { return s_startAt != 0 && s32(nowMs() - s_startAt) >= -20; }, std::chrono::milliseconds(ours ? 8000 : 3000));
     if (const s32 left = s_startAt ? s32(s_startAt - nowMs()) : 0; left > 0)
         sched::withCpuReleased([left] { std::this_thread::sleep_for(std::chrono::milliseconds(left)); });
     // The retrace messages that piled up while nobody waited for them: gone, so each turn waits for a
@@ -358,7 +395,7 @@ void ringThread(Ctx& c, u32) {
         Peer& mine = s_peers[me];
         Round& own = mine.rounds[round % kHistory];
         own.round = round, own.word0 = rd32(s_out + 6), own.sentAt = {}, own.sends = 0, own.at = {};
-        std::memcpy(own.slot, hostp(s_out + 6 + 4 + me * kSlotSize), kSlotSize);
+        std::memcpy(own.slot, hostp(s_out + 6 + 4 + place * kSlotSize), kSlotSize);  // (the game's slot for us)
         mine.contig = round;
     };
     // A turn that only makes our round (the callback is told it is its first turn: it queues nothing).
@@ -398,6 +435,10 @@ void ringThread(Ctx& c, u32) {
         // One round made per retrace, whatever happens to this thread: a turn that missed retraces (the
         // host busy) makes the rounds it owes first, so the others never wait for us.
         for (int owed = std::min<int>(s32(rd32(kRetraceCount) - retraceBase) - made - 1, 3); owed > 0; owed--) {
+            if (made >= queued + kMaxAhead) {  // (our game is not taking its sets - a loading screen: it owes none)
+                retraceBase = rd32(kRetraceCount) - u32(made) - 1;
+                break;
+            }
             makeOnly();
             total.caughtUp++, last.caughtUp++;
             if (s_checkEvery) log("[lancheck] round %d made late (at step %u)\n", made - 1, s_steps);
@@ -418,7 +459,11 @@ void ringThread(Ctx& c, u32) {
                     if (s_peers[j].contig < q) have = false;
                     else arrived = std::max(arrived, s_peers[j].rounds[q % kHistory].at);
                 }
-                lost = !have && now - mineQ.at > std::chrono::seconds(5);
+                // (lost: a console we have heard nothing at all from for that long - one loading a scene
+                // sends no new rounds, the others wait for it, but it still answers)
+                if (!have && now - mineQ.at > lostAfter())
+                    for (int j = 0; j < n; j++)
+                        if (j != me && s_peers[j].contig < q && (!s_peers[j].heard || now - s_peers[j].echoAt > lostAfter())) lost = true;
                 if (have && k == 0) {  // its slack: how long before we first wanted it, it came
                     double slack = msBetween(arrived, mineQ.at);
                     if (arrived > mineQ.at) slack = -msBetween(mineQ.at, arrived);
@@ -445,9 +490,24 @@ void ringThread(Ctx& c, u32) {
                 // the game's next logic step) then lands right before round q's step everywhere. A second
                 // set right after it (two steps in the next frame) only while no agreement is under way
                 // (+0x2C, +0x38 1: what the second could complete): the first's is then the last change.
-                while (rd8(kNetQueueCount) != 0 || s_inSteps) {
+                auto lastSent = Clock::now();
+                while (rd8(kNetQueueCount) != 0 || s_inSteps || !s_loopReady || rd8(kGmSceneOverFlag) != 0) {
                     if (rd32(kNet + 0x108) == 1) guestCall(c, kQuitCheck);
                     sched::withCpuReleased([] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); });
+                    if (Clock::now() - lastSent > std::chrono::milliseconds(15)) {  // (the others hear from us meanwhile)
+                        std::lock_guard g(s_m);
+                        sendLocked(kData);
+                        lastSent = Clock::now();
+                    }
+                }
+                // (SA2_LAN_CHECK: the game's seed here - every set before round q has run, on every PC alike)
+                constexpr u32 kGmState = 0x805359D8;
+                if (s_checkEvery && q % s_checkEvery < 2) {  // (and the scene, its frame count and countdown, the riders. places)
+                    u32 h = 2166136261u;
+                    for (u32 slot = 0; slot < morepl::count(morepl::k_ptab); slot++)
+                        for (u32 o = 8; o < 0x14; o++) h = (h ^ rd8(morepl::at(morepl::k_ptab, slot) + o)) * 16777619u;
+                    log("[lancheck] round %d seed %08X scene %02X frames %u count %d riders %08X\n", q, rd32(0x805DD0E0 - 0x3B0),
+                        rd8(kGmState + 0x7D7), rd32(kGmState + 0x7E0 + 0x40), s32(rd32(kGmState + 0x7E0 + 0x44)), h);
                 }
             }
             u8 data[kDataSize];
@@ -457,12 +517,27 @@ void ringThread(Ctx& c, u32) {
                 const double waited = -std::min(0.0, k == 0 && !window.empty() ? window.back() : 0.0);
                 total.lateMs += waited, last.lateMs += waited;
                 put32(data, s_peers[0].rounds[q % kHistory].word0);
-                for (int j = 0; j < n; j++) std::memcpy(data + 4 + j * kSlotSize, s_peers[j].rounds[q % kHistory].slot, kSlotSize);
+                for (int j = 0; j < std::min(n, kGameSlots); j++)
+                    std::memcpy(data + 4 + j * kSlotSize, s_peers[j].rounds[q % kHistory].slot, kSlotSize);
+                // PCs on spare ports: their controller (their pad 0) into their seat. (Outside a stage they send "no
+                // controller" - lansession.cpp: in the menus a controller on another port of a console is another player
+                // to wait for. Decided by the sender, it is in the data: the same for every PC.)
+                for (int j = kGameSlots; j < n; j++) {
+                    const Seat st = seatOf(j);
+                    const u8* from = s_peers[j].rounds[q % kHistory].slot;
+                    u8* to = data + 4 + st.console * kSlotSize;
+                    std::memcpy(to + 12 * st.port, from, 12);  // its PADStatus (PADRead's mask, +0x30, stays the console's)
+                }
             }
             std::memcpy(hostp(s_in + 6), data, kDataSize);
             wr32(s_in, rd32(kLap));
             wr16(s_in + 4, kDataSize);
             std::memcpy(hostp(kLbSaved), data, kDataSize);  // so all of it is round q, whatever our place
+            if (s_checkEvery && q % s_checkEvery < 2) {  // (SA2_LAN_CHECK: what the game is handed for round q - the same on every PC)
+                u32 h = 2166136261u;
+                for (u32 o = 0; o < kDataSize; o++) h = (h ^ rd8(s_in + 6 + o)) * 16777619u;
+                log("[lancheck] round %d data %08X\n", q, h);
+            }
             const u32 result = callCallback(s_in);
             queued++, done++;
             if (k == 0) keepOwn(made++);  // (a second call's round is not kept: made again next turn)
@@ -479,8 +554,9 @@ void ringThread(Ctx& c, u32) {
             }
         }
         if (ended) break;
-        if (done == 0) {  // nothing queued: still make our round, on time
-            makeOnly();
+        if (done == 0) {  // nothing queued: still make our round, on time (not past kMaxAhead: below)
+            if (made < queued + kMaxAhead) makeOnly();
+            else retraceBase++;
         } else if (done == 2) {
             total.doubled++, last.doubled++;
             if (s_checkEvery) log("[lancheck] rounds %d-%d queued together (at step %u, queue %u)\n", queued - 2, queued - 1, s_steps, rd8(kNetQueueCount));
@@ -542,6 +618,8 @@ void ringThread(Ctx& c, u32) {
     }
     log("[lansync] ring ended: %llu turns, %llu late (%.0f ms), %llu skipped, %llu doubled\n", (unsigned long long)total.turns,
         (unsigned long long)total.late, total.lateMs, (unsigned long long)total.skipped, (unsigned long long)total.doubled);
+    s_dvdArm = false;
+    dvdGateEnd();
     c.r[3] = 0;
 }
 // SA2_LAN_CHECK=<n> (tests): every n logic steps of a LAN game, the step count and the game's random
@@ -552,7 +630,10 @@ void padRenew(Ctx& c, u32 entry) {
     interpOriginal(c, entry);
     // (logic steps only - the game's step loop, 8000682C - and the random seed they use)
     if (!rd32(kLb + 0x1C) || from != 0x80006830) return;
-    if (++s_steps % s_checkEvery == 0) log("[lancheck] step %u seed %08X\n", s_steps, rd32(0x805DD0E0 - 0x3B0));
+    s_lanSteps++;
+    s_mainThread = rd32(sched::kCurrentThread);
+    if (s_dvdArm.exchange(false)) dvdGateBegin();
+    if (s_checkEvery && ++s_steps % s_checkEvery == 0) log("[lancheck] step %u seed %08X\n", s_steps, rd32(0x805DD0E0 - 0x3B0));
 }
 // The callback wakes the game's main loop when it has queued a set (8007C5EC, f_80062900(0)): the
 // loop then runs that step at once, a few ms after the retrace - and finds nothing at the next
@@ -565,6 +646,21 @@ constexpr u32 kSignalFromCallback = 0x8007C5F0;
 // thread can take the CPU from the main loop mid-step), so what the turn changes lands before the
 // next one, as in the game's ring.
 constexpr u32 kRunSteps = 0x800067A4;
+// A scene's loop (80006B58) begins - once its files are in - by emptying the network pad queue and starting
+// the consoles' agreement for it (8007CBB0, lbnet +0x2C). A set queued before that, while the scene loaded, was
+// thrown away; one queued after it went to the agreement: which of the two a round was depended on how long
+// this PC took to load - the PCs parted at scene changes (the machine stats above all: the Stadium preloads
+// there). So a set is queued only while a scene's loop runs, past its start (s_loopReady), with no scene end
+// pending (gm +0x7E0): every round lands in the same place on every PC.
+void sceneLoop(Ctx& c, u32 entry) {
+    s_loopReady = false;
+    interpOriginal(c, entry);
+    s_loopReady = false;
+}
+void loopWaitFrame(Ctx& c, u32 entry) {  // (the loop's wait for its next frame, 80006B94: past its start)
+    if (c.lr == 0x80006B98) s_loopReady = true;
+    interpOriginal(c, entry);
+}
 void runSteps(Ctx& c, u32 entry) {
     s_inSteps = true;
     interpOriginal(c, entry);
@@ -574,20 +670,50 @@ void signalFrame(Ctx& c, u32 entry) {
     if (c.lr == kSignalFromCallback && s_active) return;
     interpOriginal(c, entry);
 }
+// The net library's connect (804876A0, its connect thread): it finds the other consoles (SSDP over the LAN),
+// sorts their addresses into the ring's order and agrees on that with them - 4 at most, and about 14 s. In a
+// session of ours (setSession) every PC knows the order already: it is filled in at once - the consoles, this
+// one's place, its neighbours in the ring, an address each - with no traffic; the game goes on as after its own
+// (the ring thread: the lockstep above).
+constexpr u32 kConnect = 0x804876A0;
+void connect(Ctx& c, u32 entry) {
+    const int pcs = s_sessPcs.load();
+    if (pcs <= 0) return interpOriginal(c, entry);
+    const int me = s_sessMe.load(), consoles = std::min(pcs, kGameSlots), place = seatOf(me).console;
+    for (int k = 0; k < kGameSlots; k++) wr32(kNet + 0x3C + 4 * u32(k), k < consoles ? 0xA9FEC80Au + u32(k) : 0u);  // (169.254.200.10 + k)
+    wr8(kNet + 0x4C, u32(consoles));
+    wr8(kNet + 0x4D, u32(place));
+    wr8(kNet + 0x4E, u32(place == 0 ? consoles - 1 : place - 1));  // (the ring's previous console)
+    wr8(kNet + 0x4F, u32(place == consoles - 1 ? 0 : place + 1));  // (and next)
+    log("[lansync] connected at once: PC %d of %d, the game's console %d of %d\n", me, pcs, place, consoles);
+    c.r[3] = 0;
+}
 }  // namespace
 
+void setSession(int pcs, int me, uint32_t id) {
+    s_sessPcs = std::clamp(pcs, 0, kMaxPeers);
+    s_sessMe = std::clamp(me, 0, kMaxPeers - 1);
+    s_sessId = id;
+}
+bool inSteps() { return s_inSteps.load(); }
+uint32_t lanSteps() { return s_lanSteps.load(); }
+uint32_t mainThread() { return s_mainThread.load(); }
+int sessionPcs() { return s_sessPcs.load(); }
+int sessionMe() { return s_sessMe.load(); }
+
 void syncInstall() {
-    if (const char* e = std::getenv("SA2_LAN_CHECK")) {
-        s_checkEvery = std::max(1, std::atoi(e));
-        interpReplace(0, kPadRenew, padRenew);
-    }
+    if (const char* e = std::getenv("SA2_LAN_CHECK")) s_checkEvery = std::max(1, std::atoi(e));
+    interpReplace(0, kPadRenew, padRenew);
     if (const char* e = std::getenv("SA2_LAN_SYNC"); e && std::strcmp(e, "0") == 0) return;
     for (const auto& s : kSignature)
         if (rd32(s.addr) != s.word) return log("[lansync] %08X is %08X, not %08X: the game's own ring stays\n", s.addr, rd32(s.addr), s.word);
     setRawHandler(kEtherType, onFrame);
     if (rd32(0x8007C5EC) == 0x4BFE6315) interpReplace(0, kSignalFrame, signalFrame);  // (bl f_80062900)
     if (rd32(0x800067E4) == 0x4807644D) interpReplace(0, kRunSteps, runSteps);         // (bl f_8007CC30)
+    if (rd32(kSceneLoop) == 0x9421FFF0 && rd32(0x80006B94) == 0x4805BDA9)  // (bl f_8006293C)
+        interpReplace(0, kSceneLoop, sceneLoop), interpReplace(0, kWaitFrame, loopWaitFrame);
     if (!interpReplace(0, kRingThread, ringThread)) log("[lansync] the ring thread is not where expected: the game's own ring stays\n");
+    if (rd32(kConnect) == 0x9421FC90) interpReplace(0, kConnect, connect);  // (stwu r1, -0x370(r1))
 }
 
 }  // namespace rt::lan

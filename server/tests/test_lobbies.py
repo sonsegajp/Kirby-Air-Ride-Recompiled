@@ -302,9 +302,11 @@ class Session(ServerTest):
     def test_max_players(self):
         a, b, c = self.server_of("alice", "bob", "carol", max_players=2, auto_start=False)
         self.assertEqual(self.players(self.state(a)), ["alice", "bob"])
-        for bad in (1, 5):
+        for bad in (1, 9):  # (2-8: the 8-player build)
             with self.assertRaises(RequestFailed):
                 a.request("lobby_set", max_players=bad)
+        a.request("lobby_set", max_players=8)
+        self.assertEqual(self.state(a)["max_players"], 8)
         a.request("lobby_set", max_players=3)
         self.assertEqual(self.players(self.state(a)), ["alice", "bob", "carol"])
 

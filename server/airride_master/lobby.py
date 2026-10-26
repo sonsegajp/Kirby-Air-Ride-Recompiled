@@ -6,8 +6,8 @@ session goes round
     Lobby (gathering) -> Countdown (by itself once 2+ players are in; the host can start at once
     or cancel) -> InMatch (locked: newcomers wait for the next match) -> Results -> Lobby ...
 
-A match has at most `max_players` consoles (4: the game's LAN limit; kept per server so it can rise
-later). The *roster* is who plays: before a match, the first `max_players` members in join order;
+A match has at most `max_players` consoles (2-8; 4 unless the host says: the game's own LAN takes 4, the
+8-player build 8). The *roster* is who plays: before a match, the first `max_players` members in join order;
 during a match and its results, the match's players. The roster is one virtual LAN: the relay (and
 peer-to-peer traffic between the clients) joins exactly its consoles. Everyone else waits.
 
@@ -99,7 +99,7 @@ def _password_hash(lid, password):
 
 class Lobby:
     def __init__(self, lid, host, name, max_members, password, mode, region, migrate,
-                 max_players=P.MATCH_MAX_PLAYERS, auto_start=True, settings=None):
+                 max_players=P.MATCH_DEFAULT_PLAYERS, auto_start=True, settings=None):
         self.lid = lid
         self.name = name
         self.max = max_members

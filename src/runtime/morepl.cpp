@@ -431,8 +431,8 @@ void debugFrame() {
     }
     for (u32 i = 0; i < count(k_ptab); i++) {
         const u32 p = at(k_ptab, i);
-        log("[8p] slot %u kind %u pos %.1f %.1f %.1f fwd %.2f %.2f %.2f up %.2f %.2f %.2f\n", i, rd32(p), flt(rd32(p + 8)),
-            flt(rd32(p + 0xC)), flt(rd32(p + 0x10)), flt(rd32(p + 0x14)), flt(rd32(p + 0x18)), flt(rd32(p + 0x1C)),
+        log("[8p] slot %u kind %u ctrl %d pos %.1f %.1f %.1f fwd %.2f %.2f %.2f up %.2f %.2f %.2f\n", i, rd32(p), s8(rd8(p + 0x8D)),
+            flt(rd32(p + 8)), flt(rd32(p + 0xC)), flt(rd32(p + 0x10)), flt(rd32(p + 0x14)), flt(rd32(p + 0x18)), flt(rd32(p + 0x1C)),
             flt(rd32(p + 0x20)), flt(rd32(p + 0x24)), flt(rd32(p + 0x28)));
         if (const u32 mg = rd32(p + 0x40); rd32(p) != 4 && mg && (mg >> 24) == 0x81) {  // its machine (gobj +2C: data, +3E8 pos)
             const u32 md = rd32(mg + 0x2C);
@@ -498,6 +498,14 @@ void install() {
     }
     log("[morepl] 8-player build: %d of %zu functions replaced\n", n, sizeof repl / sizeof repl[0]);
     // SA2_8P_DEBUG: each High Jump / Air Glider list row made (3DHud_CreateHighJumpOpponentHeightElement(view, slot))
+    // The labels over the other riders (3DHud_CreateAllPlIcons 801210A8(viewer, view): one for each of slots 4..0 but
+    // the viewer's own): room for 4. A viewer in slots 6-9 (online, PCs 5-8) has no own slot among them - a fifth label,
+    // its model never loaded (jobj.c: "jobj->child" asserted, the game stopped in Kirby Melee): none for them.
+    if (rd32(0x801210A8) == 0x9421FFE0)
+        interpReplace(0, 0x801210A8, [](Ctx& c, u32 entry) {
+            if (s32(c.r[3]) >= 6) return;
+            interpOriginal(c, entry);
+        });
     if (std::getenv("SA2_8P_DEBUG") && rd32(0x8012BAE0) == 0x9421FFC0)
         interpReplace(0, 0x8012BAE0, [](Ctx& c, u32 entry) {
             log("[8p] list row: view %d slot %u (from %08X; rows", s32(c.r[3]), c.r[4], c.lr);

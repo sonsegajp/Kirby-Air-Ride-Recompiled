@@ -836,7 +836,7 @@ Lobby parseLobby(const Json& j) {
     l.region = j["region"].str();
     l.mode = parseMode(j["mode"].str());
     l.max = int(j["max"].num(kLobbyMax));
-    l.maxPlayers = int(j["max_players"].num(kMatchMax));
+    l.maxPlayers = int(j["max_players"].num(kMatchDefault));
     l.locked = j["locked"].flag();
     l.migrate = j["migrate"].flag();
     l.autoStart = j["auto_start"].flag();
@@ -2935,7 +2935,7 @@ void Client::refreshServers(Mode filter) {
                 x.region = s["region"].str();
                 x.mode = parseMode(s["mode"].str());
                 x.session = parseSession(s["state"].str());
-                x.maxPlayers = int(s["max_players"].num(kMatchMax));
+                x.maxPlayers = int(s["max_players"].num(kMatchDefault));
                 x.members = int(s["members"].num());
                 x.max = int(s["max"].num());
                 x.locked = s["locked"].flag();

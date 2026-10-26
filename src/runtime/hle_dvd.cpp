@@ -3,6 +3,7 @@
 // reads are replaced: a worker thread serves them from the user's disc image and completes each one
 // through the interrupt path (callbacks run in interrupt context, as on the console).
 #include "disc/discimage.h"
+#include "runtime/lan.h"
 #include "runtime/runtime.h"
 #include "runtime/sched.h"
 
@@ -21,11 +22,14 @@
 #include <thread>
 #include <filesystem>
 #include <memory>
+#include <map>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
 namespace rt {
 u64 gxFrames();  // src/runtime/gx.cpp
+std::atomic<u32> g_dvdGatePending{0};  // a held read issued and not yet ended for the game (below)
 
 namespace {
 std::unique_ptr<disc::Image> s_disc;  // .iso/.gcm, .ciso or .rvz (src/disc)
@@ -50,6 +54,8 @@ struct Request {
     u32 block, addr, length, callback;
     u64 offset;
     u64 seq;
+    u64 gseq = 0;  // held in a lockstep (below): its number there (1, 2, ...), of that lockstep (epoch)
+    u32 epoch = 0;
 };
 // The latest request issued on each command block: a completion for an older one (the game
 // cancelled it and reused the block) must not finish the new request with the old data.
@@ -61,6 +67,34 @@ std::mutex s_qLock;
 std::condition_variable s_qCv;
 std::deque<Request> s_queue;
 bool s_workerStarted = false;
+bool dvdLog() {
+    static const bool on = std::getenv("SA2_DVD_LOG") != nullptr;
+    return on;
+}
+
+// ---- in a lockstep (a LAN or online session of several PCs: src/runtime/lansync.cpp) ----
+// A read ends when the drive (each PC's own disc image, at host speed) has it, so on each PC the game would
+// see it end in a different logic step - and what it does once a file is in (the machine stats screen's
+// countdown, the Stadium's start) would run at different rounds: the PCs part. So in a lockstep a read's end
+// (its callback, the command block's state) is held, and told the game at a point of its own run that is the
+// same on every PC (below). (The reads are numbered in the order the game issues them.)
+struct Gate {
+    std::mutex m;
+    std::condition_variable cv;  // (a read ended)
+    bool on = false;
+    u32 epoch = 0;   // which lockstep
+    u64 issued = 0;  // reads held in it so far
+    std::map<u64, std::function<void(Ctx&)>> held;  // ended here, not yet told the game (by number)
+    std::set<u64> ended;                            // ended (or cancelled) past `done`
+    u64 done = 0;                                   // reads 1 .. done have all ended here
+    u64 released = 0;                               // reads 1 .. released told the game
+} s_gate;
+thread_local bool t_inHeldEnd = false;  // telling the game a held read's end (what it asks for next is held too)
+void gateEnded(u64 gseq) {  // (under s_gate.m)
+    s_gate.ended.insert(gseq);
+    while (s_gate.ended.count(s_gate.done + 1)) s_gate.ended.erase(++s_gate.done);
+    s_gate.cv.notify_all();
+}
 
 bool readRaw(u64 offset, void* dst, u32 len) {
     std::lock_guard g(s_discLock);
@@ -69,7 +103,7 @@ bool readRaw(u64 offset, void* dst, u32 len) {
 
 void complete(const Request& r, s32 result) {
     s_inFlight--;
-    sched::postIrq([r, result](Ctx& c) {
+    auto fn = [r, result](Ctx& c) {
         {
             std::lock_guard g(s_seqLock);
             if (s_blockSeq[r.block] != r.seq) return;  // stale: cancelled or superseded
@@ -82,7 +116,69 @@ void complete(const Request& r, s32 result) {
             c.r[4] = r.block;
             c.call(r.callback);
         }
-    });
+    };
+    if (r.gseq) {
+        std::lock_guard g(s_gate.m);
+        if (s_gate.on && r.epoch == s_gate.epoch) {
+            s_gate.held.emplace(r.gseq, [fn = std::move(fn)](Ctx& c) {
+                t_inHeldEnd = true;
+                fn(c);
+                t_inHeldEnd = false;
+            });
+            gateEnded(r.gseq);
+            return;
+        }
+    }
+    sched::postIrq(std::move(fn));
+}
+// When a held read ends for the game: at the main thread's next safe point (a loop's back edge in the game's
+// code: the same place on every PC, wherever it is - a logic step, a loading screen's loop) every read issued
+// so far ends - it waits there for any still on its way. And should the main thread sleep before one (on
+// something other than its frame queues - it waits for its own read), there: asleep at the same point
+// everywhere. So the game sees each read end at the same point of its own run on every PC, whatever the disc's
+// speed; nothing about it travels between them.
+constexpr u32 kFrameQueues = 0x80550CA8 + 0x24, kFrameQueueSize = 0x34;  // the game's frame queues (4 OSMessageQueues)
+// (under s_gate.m) Every read issued so far, once ended here: their ends, in order; `lk` released while waiting.
+std::vector<std::function<void(Ctx&)>> takeIssued(std::unique_lock<std::mutex>& lk) {
+    std::vector<std::function<void(Ctx&)>> now;
+    const u64 upTo = s_gate.issued;
+    const auto t0 = std::chrono::steady_clock::now();
+    bool told = false;
+    while (s_gate.on && s_gate.done < upTo) {
+        s_gate.cv.wait_for(lk, std::chrono::milliseconds(100));
+        if (!told && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(10))
+            told = true, log("[dvdgate] waiting 10 s for read #%llu to end\n", (unsigned long long)(s_gate.done + 1));
+    }
+    for (auto it = s_gate.held.begin(); it != s_gate.held.end() && it->first <= upTo;) now.push_back(std::move(it->second)), it = s_gate.held.erase(it);
+    s_gate.released = std::max(s_gate.released, upTo);
+    if (s_gate.issued == upTo) g_dvdGatePending = 0;
+    return now;
+}
+void gateWatch() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!g_dvdGatePending) continue;
+        const u32 main = lan::mainThread();
+        if (!main || rd16(main + sched::T_STATE) != sched::S_WAITING) continue;
+        const u32 q = rd32(main + sched::T_QUEUE);
+        if (!q || (q >= kFrameQueues && q < kFrameQueues + 4 * kFrameQueueSize)) continue;
+        std::vector<std::function<void(Ctx&)>> now;
+        {
+            std::unique_lock lk(s_gate.m);
+            if (!s_gate.on) continue;
+            now = takeIssued(lk);
+        }
+        if (dvdLog() && !now.empty()) log("[dvdgate] %zu reads end, up to #%llu (the game asleep on %08X)\n", now.size(), (unsigned long long)s_gate.released, q);
+        for (auto& fn : now) sched::postIrq(std::move(fn));
+    }
+}
+
+// A read that ends with nothing to tell (cancelled): in a lockstep it still counts as ended.
+void dropped(const Request& r) {
+    s_inFlight--;
+    if (!r.gseq) return;
+    std::lock_guard g(s_gate.m);
+    if (s_gate.on && r.epoch == s_gate.epoch) gateEnded(r.gseq);
 }
 
 // ---- the drive's timing ----
@@ -190,7 +286,7 @@ void worker() {
         {
             std::lock_guard g(s_seqLock);
             if (cancelled()) {
-                s_inFlight--;
+                dropped(r);
                 continue;
             }
         }
@@ -206,7 +302,7 @@ void worker() {
         {
             std::lock_guard g(s_seqLock);
             if (cancelled()) {
-                s_inFlight--;
+                dropped(r);
                 continue;
             }
             if (ok) std::memcpy(hostp(r.addr), buf.data(), r.length);
@@ -215,27 +311,58 @@ void worker() {
     }
 }
 
-// File containing a disc offset (from the FST in guest memory), for SA2_DVD_LOG.
+// The disc's files, from the FST in guest memory (built once, when first asked: the FST stays where the
+// apploader put it): the file at an offset, for SA2_DVD_LOG, and whether it is a stream.
+struct DiscFile {
+    u64 start, end;
+    std::string path;
+    bool stream;  // music (.hps) or a movie (.h4m): read as it plays, in real time
+};
+const std::vector<DiscFile>& discFiles() {
+    static std::vector<DiscFile> files;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const u32 fst = rd32(0x80000038);
+        if (!fst) return;
+        const u32 n = rd32(fst + 8);
+        const u32 strtab = fst + n * 12;
+        // Walk the tree keeping the directory path of each entry.
+        std::vector<std::pair<u32, std::string>> dirs{{n, ""}};
+        for (u32 i = 1; i < n; i++) {
+            while (dirs.size() > 1 && i >= dirs.back().first) dirs.pop_back();
+            const u32 w0 = rd32(fst + i * 12), w1 = rd32(fst + i * 12 + 4), w2 = rd32(fst + i * 12 + 8);
+            const std::string name = gstr(strtab + (w0 & 0xFFFFFF));
+            if (w0 >> 24) {
+                dirs.push_back({w2, dirs.back().second + name + "/"});
+                continue;
+            }
+            std::string low = name;
+            for (char& ch : low) ch = char(std::tolower(u8(ch)));
+            const bool stream = low.size() > 4 && (low.compare(low.size() - 4, 4, ".hps") == 0 || low.compare(low.size() - 4, 4, ".h4m") == 0);
+            files.push_back({w1, u64(w1) + w2, dirs.back().second + name, stream});
+        }
+        std::sort(files.begin(), files.end(), [](const DiscFile& a, const DiscFile& b) { return a.start < b.start; });
+    });
+    return files;
+}
+const DiscFile* fileOf(u64 offset) {
+    const auto& files = discFiles();
+    auto it = std::upper_bound(files.begin(), files.end(), offset, [](u64 o, const DiscFile& f) { return o < f.start; });
+    if (it == files.begin()) return nullptr;
+    --it;
+    return offset < it->end ? &*it : nullptr;
+}
 std::string fileAt(u64 offset) {
-    const u32 fst = rd32(0x80000038);
-    if (!fst) return "?";
-    const u32 n = rd32(fst + 8);
-    const u32 strtab = fst + n * 12;
-    // Walk the tree keeping the directory path of each entry.
-    std::vector<std::pair<u32, std::string>> dirs{{n, ""}};
-    for (u32 i = 1; i < n; i++) {
-        while (dirs.size() > 1 && i >= dirs.back().first) dirs.pop_back();
-        const u32 w0 = rd32(fst + i * 12), w1 = rd32(fst + i * 12 + 4), w2 = rd32(fst + i * 12 + 8);
-        const std::string name = gstr(strtab + (w0 & 0xFFFFFF));
-        if (w0 >> 24) dirs.push_back({w2, dirs.back().second + name + "/"});
-        else if (offset >= w1 && offset < u64(w1) + w2) return dirs.back().second + name + "+" + std::to_string(offset - w1);
-    }
-    return "?";
+    const DiscFile* f = fileOf(offset);
+    return f ? f->path + "+" + std::to_string(offset - f->start) : "?";
 }
 
 void submit(u32 block, u32 addr, u32 length, u64 offset, u32 callback, u32 command) {
-    static const bool s_log = std::getenv("SA2_DVD_LOG") != nullptr;
-    if (s_log) log("[dvd] frame %llu: read %s (%u bytes) -> %08X\n", (unsigned long long)gxFrames(), fileAt(offset).c_str(), length, addr);
+    static const bool s_log = std::getenv("SA2_DVD_LOG") && std::strcmp(std::getenv("SA2_DVD_LOG"), "gate") != 0;  // (gate: only the lockstep's held reads)
+    if (s_log)
+        log("[dvd] frame %llu: read %s (%u bytes) -> %08X (thread %08X%s, LAN step %u%s, callback %08X)\n", (unsigned long long)gxFrames(),
+            fileAt(offset).c_str(), length, addr, rd32(sched::kCurrentThread), sched::inInterrupt() ? " irq" : "", lan::lanSteps(),
+            lan::inSteps() ? " in steps" : "", callback);
     wr32(block + CB_COMMAND, command);
     wr32(block + CB_STATE, ST_BUSY);
     wr32(block + CB_ADDR, addr);
@@ -248,13 +375,28 @@ void submit(u32 block, u32 addr, u32 length, u64 offset, u32 callback, u32 comma
         std::lock_guard g(s_seqLock);
         seq = s_blockSeq[block] = ++s_seq;
     }
+    // Held in a lockstep: what the game's threads read, and what the end of a held read asks for next (its
+    // callback, as it is told - the same step everywhere). Not: music and movies (they read as they play, in
+    // real time - nothing in step waits for them), nor what other interrupts ask for (the streams' own).
+    u64 gseq = 0;
+    u32 epoch = 0;
+    {
+        std::lock_guard g(s_gate.m);
+        const DiscFile* f = fileOf(offset);
+        if (s_gate.on && (!sched::inInterrupt() || t_inHeldEnd) && !(f && f->stream)) {
+            gseq = ++s_gate.issued, epoch = s_gate.epoch;
+            g_dvdGatePending = 1, g_irqPending = 1;  // (the main thread's next safe point ends it)
+            if (dvdLog()) log("[dvdgate] read #%llu: %s\n", (unsigned long long)gseq, fileAt(offset).c_str());
+        }
+    }
     s_inFlight++;
     std::lock_guard g(s_qLock);
     if (!s_workerStarted) {
         s_workerStarted = true;
         std::thread(worker).detach();
+        std::thread(gateWatch).detach();
     }
-    s_queue.push_back({block, addr, length, callback, offset, seq});
+    s_queue.push_back({block, addr, length, callback, offset, seq, gseq, epoch});
     s_qCv.notify_one();
 }
 }  // namespace
@@ -265,6 +407,44 @@ std::string dvdPendingSummary() {
     std::string out = "in flight " + std::to_string(s_inFlight.load()) + ", queued " + std::to_string(s_queue.size());
     for (const Request& r : s_queue) out += "; " + fileAt(r.offset);
     return out;
+}
+
+// The lockstep's reads (above; src/runtime/lansync.cpp calls these). Begin: at its first logic step, the reads
+// from then on held.
+void dvdGateBegin() {
+    std::lock_guard g(s_gate.m);
+    s_gate.on = true, s_gate.epoch++, s_gate.issued = 0, s_gate.held.clear(), s_gate.ended.clear(), s_gate.done = 0, s_gate.released = 0;
+    g_dvdGatePending = 0;
+    log("[dvdgate] on: the game's reads end at its main thread's next safe point\n");
+}
+// End (the lockstep over): what is held goes to the game now, and reads end as they come again.
+void dvdGateEnd() {
+    std::map<u64, std::function<void(Ctx&)>> held;
+    {
+        std::lock_guard g(s_gate.m);
+        if (!s_gate.on) return;
+        s_gate.on = false;
+        g_dvdGatePending = 0;
+        held.swap(s_gate.held);
+        log("[dvdgate] off: %llu reads held, %zu given at once\n", (unsigned long long)s_gate.issued, held.size());
+    }
+    for (auto& [seq, fn] : held) sched::postIrq(std::move(fn));
+}
+// A safe point of a guest thread with a held read pending (src/runtime/cpu.cpp, before the interrupts): on the
+// game's main thread, every read issued so far ends now - the same point of its run on every PC.
+void dvdGateSafePoint(Ctx& c) {
+    if (sched::inInterrupt() || !(c.msr & 0x8000) || rd32(sched::kCurrentThread) != lan::mainThread()) return;
+    std::vector<std::function<void(Ctx&)>> now;
+    {
+        std::unique_lock lk(s_gate.m);
+        if (!s_gate.on) {
+            g_dvdGatePending = 0;
+            return;
+        }
+        now = takeIssued(lk);
+    }
+    if (dvdLog() && !now.empty()) log("[dvdgate] LAN step %u: %zu reads end, up to #%llu\n", lan::lanSteps(), now.size(), (unsigned long long)s_gate.released);
+    for (auto& fn : now) sched::postIrq(std::move(fn));  // (run by the interrupts that come next, at this point)
 }
 
 // A whole file of the disc, by its path ("MnAll.dat"; any case), from the FST read at boot: the port's

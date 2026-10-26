@@ -637,7 +637,7 @@ class MasterServer:
             raise Fail("bad_request", "Passwords are up to 64 characters.")
         migrate = msg.get("migrate", lobby.migrate if lobby else True)
         try:
-            max_players = int(msg.get("max_players", lobby.max_players if lobby else P.MATCH_MAX_PLAYERS))
+            max_players = int(msg.get("max_players", lobby.max_players if lobby else P.MATCH_DEFAULT_PLAYERS))
         except (TypeError, ValueError):
             raise Fail("bad_request", "Invalid number of players.") from None
         if not 2 <= max_players <= P.MATCH_MAX_PLAYERS:

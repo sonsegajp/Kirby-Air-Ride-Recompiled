@@ -304,6 +304,12 @@ void Ctx::stswi(int s, u32 ea, u32 n) {
 }
 
 // ---- interrupt safe points ----
-void service_irq(Ctx& c) { sched::serviceInterrupts(c); }
+extern std::atomic<u32> g_dvdGatePending;  // src/runtime/hle_dvd.cpp: a held read for the main thread's safe point
+void dvdGateSafePoint(Ctx& c);
+void service_irq(Ctx& c) {
+    if (g_dvdGatePending) dvdGateSafePoint(c);
+    sched::serviceInterrupts(c);
+    if (g_dvdGatePending) g_irqPending = 1;  // (the main thread's safe points go on stopping here until it is told)
+}
 
 }  // namespace rt

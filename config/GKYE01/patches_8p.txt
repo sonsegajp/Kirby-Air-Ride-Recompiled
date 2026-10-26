@@ -2781,3 +2781,27 @@ was 8011E268 0x3BE00004
 imm 8011E268 9  # minimap: a dot per place, 10
 was 8012BB18 0x2C1A0004
 imm 8012BB18 10  # High Jump list: an opponent row for every slot
+was 801131F4 0x2C000004
+imm 801131F4 10  # the players' HUD: every slot with a screen
+was 80113280 0x2C000004
+imm 80113280 10  # the players' HUD: every slot with a screen
+was 801132B0 0x2C000004
+imm 801132B0 10  # the players' HUD: every slot with a screen
+was 80113350 0x2C000004
+imm 80113350 10  # the players' HUD: every slot with a screen
+was 801133B4 0x2C000004
+imm 801133B4 10  # the players' HUD: every slot with a screen
+was 80113448 0x2C000004
+imm 80113448 10  # the players' HUD: every slot with a screen
+was 801134DC 0x2C000004
+imm 801134DC 10  # the players' HUD: every slot with a screen
+was 80113518 0x2C000004
+imm 80113518 10  # the players' HUD: every slot with a screen
+was 80113554 0x2C000004
+imm 80113554 10  # the players' HUD: every slot with a screen
+was 80113590 0x2C000004
+imm 80113590 10  # the players' HUD: every slot with a screen
+was 801135D4 0x2C000004
+imm 801135D4 10  # the players' HUD: every slot with a screen
+was 80113688 0x2C000004
+imm 80113688 10  # the players' HUD: every slot with a screen

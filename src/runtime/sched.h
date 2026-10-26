@@ -45,6 +45,7 @@ struct ThreadExit {};
 void adoptBootThread(u32 guest, Ctx& ctx);
 Thread* current();
 bool inInterrupt();
+bool cpuIdle();  // no guest thread runs and no interrupt waits
 Ctx* currentCtx();  // guest context of the calling host thread (debugging)
 // Whether the calling host thread may run guest code now (it owns the guest CPU, or serves
 // interrupts); otherwise the guest thread it runs and the owner's, for the report.

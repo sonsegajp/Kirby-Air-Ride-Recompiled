@@ -70,6 +70,10 @@
 #include <string>
 #include <vector>
 
+namespace rt::online {
+bool isOpen();  // src/runtime/online_menu.h
+}
+
 namespace rt::lansession {
 
 // ---------------------------------------------------------------------------------------------------
@@ -313,7 +317,8 @@ constexpr u32 kSignBits[6] = {kA, kB, kX, kY, kZ, kStart};
 std::mutex s_lock;
 struct Request {
     bool pending = false;
-    int consoles = 0, index = 0;
+    int consoles = 0, index = 0;  // the PCs (2-8: the game's consoles are the first 4 - src/runtime/lan.h)
+    uint32_t id = 0;
     Settings settings;
 } s_req;
 bool s_abortReq = false, s_abortToSelect = false, s_hideLanMenu = false;
@@ -329,6 +334,7 @@ bool s_toSelectAfterLeave = false;
 int s_matchNumber = 0;
 u32 s_sceneSteps = 0, s_sceneMajor = ~0u, s_sceneSerial = 0, s_lastLanScreen = ~0u, s_phaseSteps = 0;
 bool s_matchStarted = false;  // InMatch: the match's play scene ran (a results scene now ends it)
+u32 s_matchSerial = 0;  // InMatch: s_sceneSerial when it began (the LAN menu's frame may run again before the scene ends)
 std::chrono::steady_clock::time_point s_beginAt{};
 u32 s_localButtons = 0, s_localCalls = 0;
 // SA2_SOLO_TEST="riders=8;citysecs=60;matches=1;ct.stadium=kirby_melee;..." (tests): City Trial on this console
@@ -350,6 +356,7 @@ void setPhase(Phase p, const char* why = nullptr) {
     log("[lansession] %s -> %s%s%s\n", phaseName(s_phase), phaseName(p), why ? ": " : "", why ? why : "");
     s_phase = p;
     s_phaseSteps = 0;
+    if (p == Phase::Idle || p == Phase::Failed) lan::setSession(0, 0, 0);  // (the game's own LAN menus again)
     std::lock_guard g(s_lock);
     s_status.phase = p;
     s_status.cover = p == Phase::Connecting || p == Phase::Parked || p == Phase::Leaving || p == Phase::Waiting;
@@ -429,6 +436,43 @@ void soloStart(Ctx& c) {
 // Player Entry is over: riders 2.. are CPUs (copies of player 1's entry: another color, a CPU level).
 void ctSetup(Ctx& c, u32 entry) {
     interpOriginal(c, entry);
+    if (s_trace) {  // (SA2_LAN_SESSION_TRACE: the players the game entered, and their views)
+        for (u32 slot = 0; slot < morepl::count(morepl::k_ply_desc); slot++) {
+            char b[200];
+            int k = std::snprintf(b, sizeof b, "[lansession] ply_desc %u:", slot);
+            for (u32 o = 0; o < 0x30; o++) k += std::snprintf(b + k, sizeof b - size_t(k), "%s%02X", o % 4 ? "" : " ", rd8(morepl::plyDesc(slot) + o));
+            const u32 v = morepl::at(morepl::k_view_desc, slot);
+            log("%s | view %02X %02X %02X\n", b, rd8(v), rd8(v + 1), rd8(v + 2));
+        }
+    }
+    if (morepl::active() && lan::sessionPcs() > 0 && s_phase == Phase::InMatch) {
+        // A session of ours in the 8-player build. Riders 6-9: the game's Player Entry (its loops raised to 10)
+        // leaves copies there (a CPU, a "human" on pad 8) - none; then, with more than 4 PCs, PCs 4-7's riders,
+        // humans on their seats' pads (src/runtime/lan.h), only this PC's own with a screen.
+        const int pcs = lan::sessionPcs(), me = lan::sessionMe();
+        for (u32 slot = 6; slot < 10; slot++) wr8(morepl::plyDesc(slot), 4);
+        u32 used = 0;
+        for (int i = 0; i < 4; i++)
+            if (rd8(morepl::plyDesc(u32(i))) != 4) used |= 1u << (rd8(morepl::plyDesc(u32(i)) + 4) & 7);
+        for (int pc = 4; pc < pcs; pc++) {
+            const u32 slot = u32(lan::riderOf(pc)), d = morepl::plyDesc(slot), from = morepl::plyDesc(0);
+            for (u32 k = 0; k < 0x30; k += 4) wr32(d + k, rd32(from + k));  // (as player 1's entry: a human)
+            u32 colour = 0;
+            while (colour < 7 && (used >> colour & 1)) colour++;
+            used |= 1u << colour;
+            wr8(d + 4, colour);
+            wr8(d + 6, u32(lan::padOf(pc)));  // its controller: its seat's pad
+            const u32 v = morepl::at(morepl::k_view_desc, slot);
+            wr8(v + 0, 0xFF);
+            wr8(v + 1, pc == me ? 1 : 0);
+            wr8(v + 2, 0xFF);
+        }
+        int riders = 0;
+        for (int i = 0; i < morepl::riders(); i++) riders += rd8(morepl::plyDesc(morepl::riderSlot(i))) != 4 ? 1 : 0;
+        guestCall(c, kSetRiderCount, {u32(riders)});
+        log("[lansession] %d riders for %d PCs (this one's: slot %d)\n", riders, pcs, pcs > 4 ? lan::riderOf(me) : -1);
+        return;
+    }
     if (!s_solo.inMatch || s_solo.riders < 2) return;
     const int riders = std::min(s_solo.riders, morepl::riders());
     for (int i = 1; i < riders; i++) {
@@ -454,6 +498,25 @@ void ctSetup(Ctx& c, u32 entry) {
     log("[solo] %d riders entered%s\n", riders, morepl::active() ? " (8-player build)" : "");
 }
 
+// The LAN game's screens (f_80020188, at the end of Player Entry): only this console's riders keep theirs. Its
+// loops are unrolled for 4 slots - and with 2 consoles, in the 8-player build, write past the views (the
+// relocation split that loop) - so in a session of ours it is done here, for every slot: a rider keeps its screen
+// when it reads this PC's controller (2 consoles share the 4 pads two each, 3 and 4 one each; past 4 PCs, each
+// PC its seat's pad - src/runtime/lan.h). This PC's screens differ from the others' as in the game's own LAN.
+constexpr u32 kLanViews = 0x80020188;
+void lanViews(Ctx& c, u32 entry) {
+    const int pcs = lan::sessionPcs();
+    if (pcs <= 0 || !morepl::active()) return interpOriginal(c, entry);
+    const int me = lan::sessionMe(), perConsole = pcs == 2 ? 2 : 1;
+    for (u32 slot = 0; slot < morepl::count(morepl::k_view_desc); slot++) {
+        const u32 v = morepl::at(morepl::k_view_desc, slot) + 1;
+        if (!rd8(v)) continue;
+        const int pad = rd8(morepl::plyDesc(slot) + 6);
+        const bool mine = pcs > 4 ? pad == lan::padOf(me) : pad < 4 && pad / perConsole == me;
+        if (!mine) wr8(v, 0);
+    }
+}
+
 // From the LAN menu's screen 6 (in step on every console): the match starts.
 void startMatch(Ctx& c) {
     const Settings& s = s_cur.settings;
@@ -476,6 +539,7 @@ void startMatch(Ctx& c) {
     guestCall(c, kEndMode);
     s_matchNumber++;
     s_matchStarted = false;
+    s_matchSerial = s_sceneSerial;
     s_rematchSign = false;
     {
         std::lock_guard g(s_lock);
@@ -531,8 +595,10 @@ void startConnecting(Ctx& c, const Request& r) {
     s_cur = r;
     lan::setLocalDhcp(true);
     lan::setLocalDhcpPlace(r.index);
-    wr8(kLm + 0, u32(r.consoles));
-    wr32(kLm + 0x20, u32(r.consoles - 2));  // ("How many": the cursor, 2/3/4)
+    lan::setSession(r.consoles, r.index, r.id);  // (the connection filled in at once, the lockstep for all the PCs)
+    const int consoles = std::min(r.consoles, 4);
+    wr8(kLm + 0, u32(consoles));
+    wr32(kLm + 0x20, u32(consoles - 2));  // ("How many": the cursor, 2/3/4)
     guestCall(c, kLbNetStart);               // ("Is it OK to connect?" Yes)
     wr32(kLm + 0x14, 4);                     // "Connecting..."
     {
@@ -619,7 +685,7 @@ void lanMenuFrame(Ctx& c, u32 entry) {
         }
         break;
     case Phase::InMatch:  // (back in the LAN menu during a match: someone ended it from the pause menu)
-        if (connected) {
+        if (connected && s_sceneSerial != s_matchSerial) {
             setPhase(Phase::Parked);
             matchOver(false);
         }
@@ -630,10 +696,12 @@ void lanMenuFrame(Ctx& c, u32 entry) {
             break;
         }
         if (s_rematchSign) {  // every console's pad shows the same sign: everyone starts, in this step
-            const int n = consoles();
+            // (every PC's pad: past 4 PCs, those on spare ports too - each its seat's, src/runtime/lan.h)
+            const int n = lan::sessionPcs() > 0 ? lan::sessionPcs() : consoles();
+            auto padOfPc = [](int i) { return 4 + 4 * u32(lan::seatOf(i).console) + u32(lan::seatOf(i).port); };
             const u32 sign = heldInGame(4) & (kDpad | kA | kB | kX | kY | kZ | kStart);
             bool all = (sign & kDpad) == kDpad;
-            for (int i = 1; i < n && all; i++) all = (heldInGame(4 + 4 * u32(i)) & (kDpad | kA | kB | kX | kY | kZ | kStart)) == sign;
+            for (int i = 1; i < n && all; i++) all = (heldInGame(padOfPc(i)) & (kDpad | kA | kB | kX | kY | kZ | kStart)) == sign;
             u32 mine = kDpad;
             for (int b = 0; b < 6; b++)
                 if (hash(s_cur.settings) >> b & 1) mine |= kSignBits[b];
@@ -683,6 +751,13 @@ void lanMenuFrame(Ctx& c, u32 entry) {
 void testFrame();
 // Select Mode's frame: begin() leaves it as if LAN were chosen.
 void selectModeFrame(Ctx& c, u32 entry) {
+    // The Online menu open over it (src/runtime/online_menu.cpp), no match asked for yet: it stands still - left
+    // to run, with no input (the menu takes it) it would go back to the title after a while, and a match then
+    // starting would find no Select Mode to leave from.
+    if (online::isOpen() && s_phase == Phase::Idle) {
+        std::lock_guard g(s_lock);
+        if (!s_req.pending) return;
+    }
     interpOriginal(c, entry);
     testFrame();
     if (s_solo.on && !s_solo.begun && sceneStep() > 30 && !rd8(kGmSceneOver)) {
@@ -733,11 +808,12 @@ void entryFrame(Ctx& c, u32 entry, bool airRide) {
         if (k >= 40 && k % 15 == 0) pressInGame(0, kStart);
     }
     if (s_phase == Phase::InMatch) {
-        const int n = consoles();
-        if (k == 20)
-            for (int i = 0; i < n; i++) pressInGame(4 + 4 * u32(i), kA);
+        // Each PC's player joins as a person would: A on its own controller (in LAN games Player Entry reads the
+        // consoles' input as it comes, not the pads as they are afterwards; the lockstep brings it to every PC in
+        // the same step), a few times over (the screen takes it once it is ready).
+        if ((k == 20 || k == 35 || k == 50) && lan::sessionMe() < 4) pressLocal(kA);  // (PCs past 4: riders 6-9, entered after)
         if (airRide && s_cur.settings.get(ArMachines) == 1 && k >= 50 && k % 30 == 20) pressLocal(kA);  // Quick
-        if (k >= 40 && k % 15 == 0) pressInGame(0, kStart);  // (taken once everyone is ready)
+        if (k >= 70 && k % 20 == 0 && lan::sessionMe() == 0) pressLocal(kStart);  // (PC 0: taken once everyone is ready)
     }
     interpOriginal(c, entry);
 }
@@ -748,8 +824,7 @@ void ctEntryFrame(Ctx& c, u32 entry) { entryFrame(c, entry, false); }
 void statsFrame(Ctx& c, u32 entry) {
     const u32 k = sceneStep();
     if (s_solo.inMatch && k >= 240 && k % 30 == 0) pressInGame(0, kA);
-    if (s_phase == Phase::InMatch && k >= 480 && k % 30 == 0)
-        for (int i = 0; i < consoles(); i++) pressInGame(4 + 4 * u32(i), kA);
+    if (s_phase == Phase::InMatch && k >= 480 && k % 30 == 0 && lan::sessionMe() < 4) pressLocal(kA);  // (each console, on its controller)
     interpOriginal(c, entry);
 }
 
@@ -768,7 +843,7 @@ void resultsFrame(Ctx& c, u32 entry) {
         }
         return;
     }
-    if (s_phase == Phase::InMatch && k >= u32(s_cur.settings.get(ResultsSeconds)) * 60 && k % 20 == 0) pressInGame(0, kStart), pressInGame(4, kStart);
+    if (s_phase == Phase::InMatch && k >= u32(s_cur.settings.get(ResultsSeconds)) * 60 && k % 20 == 0) pressLocal(kStart);
     interpOriginal(c, entry);
     if (s_phase == Phase::InMatch && rd8(kGmSceneOver)) {
         guestCall(c, kSetNextMode, {kModeLan});
@@ -810,7 +885,7 @@ void padRead(Ctx& c, u32 entry) {
     testAbilities(c);
     u32 add = 0;
     if (s_localCalls) add |= s_localButtons, s_localCalls--;
-    if (s_solo.inMatch && rd8(kGmMajor) == 0x11) {  // (solo test: the Stadium's title card waits for A)
+    if ((s_solo.inMatch || (s_phase == Phase::InMatch && lan::sessionMe() < 4)) && rd8(kGmMajor) == 0x11) {  // (the Stadium's title card waits for A)
         static u32 s_n = 0;
         if (++s_n % 40 < 3) add |= kA;
     }
@@ -818,6 +893,12 @@ void padRead(Ctx& c, u32 entry) {
         add |= kDpad;
         for (int b = 0; b < 6; b++)
             if (hash(s_cur.settings) >> b & 1) add |= kSignBits[b];
+    }
+    // A PC past 4 (on a spare port of a console, src/runtime/lan.h): outside a stage, no controller - in the menus a
+    // controller on another port of a console is another player for them to wait for (its rider is entered for it).
+    if (out && lan::sessionPcs() > 4 && lan::sessionMe() >= 4 && rd8(kGmMajor) != 0x12) {
+        for (u32 o = 0; o < 10; o++) wr8(out + o, 0);
+        wr8(out + 0xA, 0xFF);  // (PAD_ERR_NO_CONTROLLER)
     }
     if (add && out) {
         wr16(out, rd16(out) | add);
@@ -829,6 +910,8 @@ void padRead(Ctx& c, u32 entry) {
 
 void install() {
     if (s_installed) return;
+    // SA2_TEST_CITYSECS=<n> (tests: online matches through the Online menu): a city shorter than the menus allow.
+    if (const char* e = std::getenv("SA2_TEST_CITYSECS")) s_testCitySeconds = std::atoi(e);
     if (const char* e = std::getenv("SA2_LAN_SESSION"); e && std::strcmp(e, "0") == 0) return;
     for (const auto& s : kSignature)
         if (rd32(s.addr) != s.word) return log("[lansession] %08X is %08X, not %08X: not the expected game - no LAN sessions\n", s.addr, rd32(s.addr), s.word);
@@ -840,6 +923,7 @@ void install() {
               interpReplace(0, kCtResultsFrame, resultsFrame) && interpReplace(0, kPadRead, padRead) &&
               interpReplace(0, kCtSetup, ctSetup);
     if (!ok) return log("[lansession] the game's functions are not where expected - no LAN sessions\n");
+    if (rd32(kLanViews) == 0x9421FFF0) interpReplace(0, kLanViews, lanViews);
     s_installed = true;
     log("[lansession] ready\n");
 }
@@ -928,7 +1012,8 @@ void testInit() {
     });
 }
 void testFrame() {  // (Select Mode reached: begin())
-    if (s_test.consoles && !s_test.begun && rd8(kGmMode) == kModeSelect && rd8(kGmMajor) == kSceneSelectMode) {
+    // (a second on Select Mode first: a test's menu script - SA2_MENU_SEQ "START~mode select" - sees it and stops)
+    if (s_test.consoles && !s_test.begun && rd8(kGmMode) == kModeSelect && rd8(kGmMajor) == kSceneSelectMode && sceneStep() > 60) {
         s_test.begun = true;
         begin(s_test.consoles, s_test.index, s_test.settings);
     }
@@ -942,14 +1027,16 @@ Status status() {
     return s_status;
 }
 
-bool begin(int n, int index, const Settings& settings) {
-    if (n < 2 || n > 4 || index < 0 || index >= n) return false;
+bool begin(int n, int index, const Settings& settings, uint32_t id) {
+    if (n < 2 || n > (morepl::active() ? 8 : 4) || index < 0 || index >= n) return false;
+    if (n > 4 && settings.game != Game::CityTrial) return false;  // (Air Ride: 4 riders still)
     std::lock_guard g(s_lock);
     if (s_status.phase == Phase::Connecting || s_status.phase == Phase::InMatch) return false;
     s_req.pending = true;
     s_req.consoles = n;
     s_req.index = index;
     s_req.settings = settings;
+    s_req.id = id ? id : hash(settings) ^ u32(n) * 0x9E3779B9u;
     s_abortReq = false;
     if (s_status.phase == Phase::Idle || s_status.phase == Phase::Failed) {
         s_status.phase = Phase::Waiting;

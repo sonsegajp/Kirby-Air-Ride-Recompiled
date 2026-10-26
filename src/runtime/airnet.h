@@ -38,8 +38,9 @@ namespace rt::airnet {
 inline constexpr int kProtoVersion = 2;    // the control protocol this client speaks
 inline constexpr int kDefaultPort = 27600; // master's TCP port when the address names none
 inline constexpr int kLobbyMax = 16;       // people in a hosted server
-inline constexpr int kMatchMax = 4;        // consoles in a match (the game's LAN limit, for now)
-inline constexpr int kGroupMax = kMatchMax;  // (old name)
+inline constexpr int kMatchMax = 8;        // consoles in a match (8: the 8-player build; the game's own LAN takes 4)
+inline constexpr int kMatchDefault = 4;    // (a server's unless its host says)
+inline constexpr int kGroupMax = kMatchDefault;  // (old name)
 inline constexpr int kUsernameMin = 3, kUsernameMax = 16;
 inline constexpr int kPasswordMin = 6;
 inline constexpr int kChatMax = 200;
@@ -113,7 +114,7 @@ struct ServerInfo {  // one row of the server browser
     SessionState session = SessionState::Lobby;
     int members = 0;
     int max = 0;
-    int maxPlayers = kMatchMax;
+    int maxPlayers = kMatchDefault;
     bool locked = false;  // password protected
     int playing = 0;      // consoles in the match on now (0: none)
     int pingMs = -1;      // the host's round trip to the master (-1: unknown)
@@ -155,7 +156,7 @@ struct Lobby {
     std::string region;
     Mode mode = Mode::Any;
     int max = kLobbyMax;
-    int maxPlayers = kMatchMax;  // consoles a match
+    int maxPlayers = kMatchDefault;  // consoles a match
     bool locked = false;
     bool migrate = true;         // a new host when the host leaves (else the server closes)
     bool autoStart = true;       // the countdown starts by itself once 2 are in
@@ -237,7 +238,7 @@ struct Snapshot {
 struct HostOptions {
     std::string name;            // empty: "<you>'s server"
     int maxMembers = kLobbyMax;  // 2..16
-    int maxPlayers = kMatchMax;  // consoles a match, 2..kMatchMax
+    int maxPlayers = kMatchDefault;  // consoles a match, 2..kMatchMax
     std::string password;        // empty: open
     Mode mode = Mode::Any;
     std::string region;          // up to 12 of A-Z a-z 0-9 space -

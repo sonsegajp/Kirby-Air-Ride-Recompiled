@@ -796,16 +796,19 @@ int runFrontend(int argc, char** argv, bool headless, u64 maxFrames, void (*star
                                      GX_LOAD_BP_REG, 0x52, 0x00, 0x08, 0x00}; // texture copy + clear
             aurora::gx::fifo::write_data(red, sizeof red);
         }
-        aurora::gx::fifo::write_data(frame.data(), u32(frame.size()));
-        const double c2 = gxNow();
-        s_tWrite += c2 - c1;
-        renders++;
         // SA2_DUMP_FROM counts from the start, or with SA2_DUMP_REL=<module id> from that REL's link.
         static const u64 s_dumpFrom = std::getenv("SA2_DUMP_FROM") ? std::strtoull(std::getenv("SA2_DUMP_FROM"), nullptr, 10) : 0;
         static const int s_dumpRel = std::getenv("SA2_DUMP_REL") ? std::atoi(std::getenv("SA2_DUMP_REL")) : -1;
         const u64 relLink = s_dumpRel >= 0 ? g_relLinkFrame[s_dumpRel & 255].load() : 1;
         const u64 dumpAt = relLink ? relLink - 1 + s_dumpFrom : ~0ull;
-        if (newFrame && dumpDir && dumpEvery && presented >= dumpAt && (presented - dumpAt) % dumpEvery == 0) {
+        const bool dumpThis = newFrame && dumpDir && dumpEvery && presented >= dumpAt && (presented - dumpAt) % dumpEvery == 0;
+        // SA2_NO_DRAW=1 (load tests: many copies on one PC): the game runs, its frames are not drawn - but those dumped.
+        static const bool s_noDraw = std::getenv("SA2_NO_DRAW") != nullptr;
+        if (!s_noDraw || dumpThis) aurora::gx::fifo::write_data(frame.data(), u32(frame.size()));
+        const double c2 = gxNow();
+        s_tWrite += c2 - c1;
+        renders++;
+        if (dumpThis) {
             if (std::getenv("SA2_DUMP_QUAD") || (s_isolate && !std::strcmp(s_isolate, "quad"))) requestFrameDump(presented);
             char path[512];
             std::snprintf(path, sizeof path, "%s/frame_%05llu.rgba", dumpDir, (unsigned long long)presented);

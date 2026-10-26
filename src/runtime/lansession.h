@@ -113,7 +113,9 @@ Status status();
 // From Select Mode, the game's Online mode (any of its screens), or Parked (same consoles: a rematch at once; else
 // it leaves the old session and connects anew). Returns false (nothing changes) if the arguments are invalid or a
 // session is connecting/in a match.
-bool begin(int consoles, int myIndex, const Settings& settings);
+// consoles: the PCs, 2-4 (2-8 in the 8-player build: the game sees 4 consoles, PCs 4-7 on their spare ports -
+// src/runtime/lan.h); id: the same on all of them, different for each session (the match's seed).
+bool begin(int consoles, int myIndex, const Settings& settings, uint32_t id = 0);
 // Leaves (connecting: cancels; in a match or parked: disconnects - the others' sessions fail). The game ends in
 // its Online mode, hidden while the Online menu covers it; `toSelectMode`: back to Select Mode instead.
 void abort(bool toSelectMode = false);

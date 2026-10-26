@@ -183,6 +183,10 @@ void wakeupLocked(u32 queue) {
 
 Thread* current() { return t_self; }
 bool inInterrupt() { return t_inIrq; }
+bool cpuIdle() {
+    std::lock_guard lk(g_m);
+    return g_running == nullptr && g_irqq.empty();
+}
 Ctx* currentCtx() { return t_inIrq ? &g_irqCtx : (t_self ? t_self->ctx : nullptr); }
 bool ownsCpu(u32* self, u32* owner) {
     const Thread* running = g_running;  // (read without the lock: a check, not a decision)

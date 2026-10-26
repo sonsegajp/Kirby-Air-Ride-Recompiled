@@ -58,7 +58,7 @@ bool begin(const Start& st) {
     lansession::setHideLanMenu(true);
     const lansession::Settings ls = toSession(Settings::fromJson(st.settingsJson));
     g_overSeen = lansession::status().matchSerial;
-    g_began = lansession::begin(st.consoles, st.me, ls);
+    g_began = lansession::begin(st.consoles, st.me, ls, st.seed ^ u32(st.consoles) * 0x9E3779B9u);
     log("[onlinegame] match: %d consoles, this one %d: %s\n", st.consoles, st.me, g_began ? "the game starts it" : "the game could not start it");
     return g_began;
 }

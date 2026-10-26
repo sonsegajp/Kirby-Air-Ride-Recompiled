@@ -32,6 +32,7 @@
 // shot (SA2_ONLINE_SHOT=<dir> receives online_<n>.rgba: what the menu drew, as the F1 menu's SA2_MENU_SHOT).
 // SA2_ONLINE=0 turns the menu off; with SA2_LAN_LOOPBACK (developer LAN tests) it does not open by itself.
 #include "runtime/online_menu.h"
+#include "runtime/morepl.h"
 #include "runtime/airnet.h"
 #include "runtime/kirbymodel.h"
 #include "runtime/lanport.h"
@@ -261,13 +262,15 @@ struct Forms {
     Field newPass{"", 64, Allow::Password, true, "at least 6 characters"};
     Field hostName{"", 32, Allow::Text, false, ""};
     Field hostPass{"", 64, Allow::Password, true, "none: open to all"};
-    int hostMax = 8, hostPlayers = an::kMatchMax, hostMode = game::kCityTrial;
+    int hostMax = 8, hostPlayers = an::kMatchDefault, hostMode = game::kCityTrial;
     bool hostAuto = true;
     Field chat{"", an::kChatMax, Allow::Text, false, "Say something..."};
     Field joinPass{"", 64, Allow::Password, true, ""};
 } f;
 
 an::Snapshot s;  // airnet's state, read once a frame
+// The most consoles a match can have here: 8 in the 8-player build (src/runtime/morepl.h), else the game's 4.
+int maxMatchPlayers() { return morepl::active() ? an::kMatchMax : 4; }
 
 an::Client& net() { return an::client(); }
 double nowT() { return ImGui::GetCurrentContext() ? ImGui::GetTime() : 0.0; }
@@ -1294,11 +1297,18 @@ void screenHost(Frame& fr) {
               [](int d) { f.hostMax = std::clamp(f.hostMax + d, 2, an::kLobbyMax); });
     char playv[16];
     std::snprintf(playv, sizeof playv, "%d players", f.hostPlayers);
-    rowChoice(fm, "Match Players", playv, "How many play in each match (2-4: the game's limit).",
-              [](int d) { f.hostPlayers = std::clamp(f.hostPlayers + d, 2, an::kMatchMax); });
+    rowChoice(fm, "Match Players", playv,
+              morepl::active() ? "How many play in each match (2-8; more than 4: City Trial)." : "How many play in each match (2-4).",
+              [](int d) {
+                  f.hostPlayers = std::clamp(f.hostPlayers + d, 2, maxMatchPlayers());
+                  if (f.hostPlayers > 4) f.hostMode = game::kCityTrial;  // (Air Ride: 4 riders still)
+              });
     rowField(fm, "Password", f.hostPass, "Optional: only those who know it can join. Empty: open to everyone.", [] { g.focus[int(g.screen)]++; });
     rowChoice(fm, "Mode", game::modeName(f.hostMode), "Air Ride or City Trial (its rules are set in the server, and can change between matches).",
-              [](int) { f.hostMode = f.hostMode == game::kAirRide ? game::kCityTrial : game::kAirRide; });
+              [](int) {
+                  if (f.hostPlayers > 4) return toast("Matches of more than 4 are City Trial.");
+                  f.hostMode = f.hostMode == game::kAirRide ? game::kCityTrial : game::kAirRide;
+              });
     rowToggle(fm, "Start by Itself", f.hostAuto, "On: a match counts down by itself once 2 are in. Off: you start each match.");
     rowButton(fm, "Create Server", "Open the server: you are in it at once.", [] {
         an::HostOptions o;
@@ -1599,6 +1609,7 @@ void screenLobby(Frame& fr) {
         auto rowY = [&](int i) { return listTop + float(i - g.settingsTop) * pitch; };
         auto shown = [&](int i) { return i >= g.settingsTop && i < g.settingsTop + fits; };
         settingRow(dl, ax0 + U(10), ax1, rowY(0), "Mode", game::modeName(st.mode), editable, "Air Ride or City Trial.", [st, change](int) {
+            if (s.lobby.maxPlayers > 4 && st.mode == game::kCityTrial) return toast("Matches of more than 4 are City Trial.");
             change(game::Settings::defaults(st.mode == game::kAirRide ? game::kCityTrial : game::kAirRide));
         }, shown(0));
         for (int i = 1; i < n; i++) {
@@ -2220,6 +2231,7 @@ void drawFrame(ImDrawList* dl, float appear, bool live) {
 
 int g_shotAt = -1;
 bool g_testWanted = false;  // (SA2_ONLINE_TEST's lanflow: as if the game asked for the link)
+bool g_testJoin = false;    // (its join: into the first server listed, until in its lobby)
 
 struct TestStep {
     int delay;
@@ -2247,8 +2259,9 @@ void runTest(int frame) {
     static size_t next = 0;
     static int at = 0;
     while (next < steps.size() && frame >= at + steps[next].delay) {
-        at += steps[next].delay;
         const std::string& w = steps[next].what;
+        if (w.rfind("waitfor=", 0) == 0 && int(s.lobby.members.size()) < std::atoi(w.c_str() + 8)) break;  // (until that many in the lobby)
+        at = w.rfind("waitfor=", 0) == 0 ? frame : at + steps[next].delay;
         log("[onlinemenu] test step %zu at %d: %s\n", next, frame, w.c_str());
         next++;
         static const std::pair<const char*, u32> kNames[] = {{"up", kUp},     {"down", kDown},   {"left", kLeft}, {"right", kRight},
@@ -2276,6 +2289,18 @@ void runTest(int frame) {
             if (Field* fd = g.osk ? g.oskField : g.typing) fd->type(w.c_str() + 5);
         } else if (w == "shot") {
             g_shotAt = frame;  // (written once this frame is drawn)
+        } else if (w == "join") {  // (to the server list, then into the first server listed - until in its lobby)
+            g_testJoin = true;
+        }
+    }
+    if (g_testJoin) {
+        if (s.inLobby) {
+            g_testJoin = false;
+            log("[onlinemenu] test: in the lobby\n");
+        } else if (g.screen == Screen::Main && !g.inModal) {
+            go(Screen::Browse);
+        } else if (g.screen == Screen::Browse && !g.inModal && !s.servers.empty() && frame % 60 == 0) {
+            net().join(s.servers[0].id);
         }
     }
 }

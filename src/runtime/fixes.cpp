@@ -1,6 +1,6 @@
 // Changes to the game's own code (widescreen, culling and the like), applied while the module they
 // are in is linked (instructions run through the interpreter with host code in their place,
-// src/runtime/interp.h). Kirby Air Ride has none yet.
+// src/runtime/interp.h).
 #include "runtime/interp.h"
 #include "runtime/runtime.h"
 
@@ -44,6 +44,18 @@ void gameFixesUnlinked(u32 module) {
 }
 
 void gameFixesInit() {
+    // The sound library's stream voice (synth.c line 1590, at 80448D38): a stream whose data came late ("Program
+    // streaming dropped") is freed with its request still pending, and the assert stops the game. What follows it
+    // already copes (the voice ends, its callback is told): the music drops out for a moment instead. Late data is
+    // a host too busy to keep the game at full speed (several copies on one PC; a slow one).
+    if (rd32(0x80448D38) == 0x4BFDF781) {  // (bl __assert)
+        interpPatch(0x80448D38, interpHookWord([](Ctx&, u32) -> u32 {
+            static std::atomic<int> s_n{0};
+            if (s_n++ < 5) log("[fixes] a music stream's data came late: it stops (the game's assert at synth.c:1590 skipped)\n");
+            return 0x80448D3C;
+        }));
+        interpOverrideAt(0x80448D38);
+    }
     // SA2_LOGIC_STEPS (debugging): how many logic steps the main loop runs per drawn frame (the
     // retraces since the last one, f_800628A0, checked at 80006BD8), logged every 600 frames.
     if (std::getenv("SA2_LOGIC_STEPS")) {
