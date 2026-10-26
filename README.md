@@ -15,13 +15,15 @@ everything else from the disc as it plays.
 - **Widescreen** at any aspect ratio, with the HUD kept at the screen's edges and the menus laid out for it; or the
   original 4:3.
 - **Smooth motion** on 120/144 Hz displays (in-between frames), the game itself at its 60 Hz.
-- **Online play** in the game's own LAN mode (Air Ride and City Trial, up to 4 consoles a match): accounts, a server
-  browser, lobbies with chat and host settings, peer-to-peer connections with a relay as fallback, and a lockstep
-  netcode that hides latency. Play on the official service or on a **dedicated server** anyone can run
-  ([docs/ONLINE.md](docs/ONLINE.md)).
+- **Online play** in the game's own LAN mode (Air Ride and City Trial, up to 4 players a match - **up to 8 in City
+  Trial** with the 8-rider build): accounts, a server browser, lobbies with chat and host settings, peer-to-peer
+  connections with a relay as fallback, and a lockstep netcode that hides latency. Play on the official service or
+  on a **dedicated server** anyone can run ([docs/ONLINE.md](docs/ONLINE.md)).
 - **A settings menu** (F1) drawn with the game's own art: display, frame rate, in-between frames, volume.
-- **More than 4 riders** (work in progress, developer build): City Trial with 8 riders - start spots, the Stadiums,
-  the HUD (places 5th-8th, the High Jump and Air Glider lists), the machine stats and the results for 8
+- **8 riders in City Trial** (the 8-rider build): start spots, the Stadiums, the HUD (places 5th-8th, the High Jump
+  and Air Glider lists), the machine stats and the results for 8 - and **8 players online**, one per PC, each with
+  their own screen and HUD, in step through the whole match. Air Ride stays at 4 for now; riders 5-8 have no name
+  label floating over them; two 8-player matches in a row in one lobby are not tested yet
   ([docs/MORE_PLAYERS.md](docs/MORE_PLAYERS.md)).
 
 ## Screenshots
@@ -55,7 +57,7 @@ everything else from the disc as it plays.
   <img src="docs/images/online_dedicated_settings.png" width="49%" alt="Online Settings: choosing a dedicated server">
 </p>
 
-### 8 riders (developer build)
+### 8 riders
 
 <p>
   <img src="docs/images/8p_results.png" width="49%" alt="A Stadium's results for 8 riders">
@@ -84,7 +86,8 @@ Play.bat                                                               # asks fo
 ```
 
 Nothing generated from your disc ever enters the repository (`orig\` and `build\` are ignored). The 8-rider build is
-made the same way with `tools\build8p.ps1` (into `build\8p-agent`).
+made the same way with `tools\build8p.ps1` (into `build\8p-agent`); for 8-player online every player uses it, and the
+host sets **Match Players** above 4 (City Trial).
 
 **Online:** a build made from this repository has no official service built in (its address is set when building:
 `-DKAR_ONLINE_MASTER=host:port`, or `online_master.txt`). Use a dedicated server: in the game, **Online > Settings >

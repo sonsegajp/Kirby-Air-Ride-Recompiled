@@ -9,4 +9,4 @@ to each other. Python standard library only.
 See ../DEPLOY.md and ../../docs/ONLINE.md.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

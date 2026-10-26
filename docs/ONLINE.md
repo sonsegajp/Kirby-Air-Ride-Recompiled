@@ -1,7 +1,8 @@
 # Online play
 
 Kirby Air Ride's own LAN mode (Air Ride and City Trial, up to 4 consoles per match - the game's
-limit), played over the internet: a master server for accounts, the server browser and sessions,
+limit; up to 8 players in City Trial with the 8-rider build, PCs 5-8 on spare controller ports of
+the first two consoles: [MORE_PLAYERS.md](MORE_PLAYERS.md)), played over the internet: a master server for accounts, the server browser and sessions,
 and the game's LAN frames peer to peer between the players where a direct path works, through the
 master's relay where not.
 
