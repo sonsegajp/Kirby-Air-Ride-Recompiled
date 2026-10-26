@@ -509,6 +509,10 @@ void ctSetup(Ctx& c, u32 entry) {
         wr8(v + 1, 0);
         wr8(v + 2, rd8(morepl::at(morepl::k_view_desc, 1) + 2));
     }
+    for (int i = riders; i < morepl::riders(); i++) {  // (the rest: no one - the setup loops' copies)
+        wr8(morepl::plyDesc(morepl::riderSlot(i)), 4);
+        wr8(morepl::at(morepl::k_view_desc, morepl::riderSlot(i)) + 1, 0);
+    }
     if (s_solo.allCpu) {
         wr8(morepl::plyDesc(0) + 0, 1);
         wr8(morepl::plyDesc(0) + 9, 4);

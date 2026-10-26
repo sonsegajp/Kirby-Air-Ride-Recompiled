@@ -501,6 +501,16 @@ void install() {
     // The labels over the other riders (3DHud_CreateAllPlIcons 801210A8(viewer, view): one for each of slots 4..0 but
     // the viewer's own): room for 4. A viewer in slots 6-9 (online, PCs 5-8) has no own slot among them - a fifth label,
     // its model never loaded (jobj.c: "jobj->child" asserted, the game stopped in Kirby Melee): none for them.
+    // A rider's City Trial stats as saved (Patch_GetPlySavedValue 8000AB48(slot, stat, saved)): it takes the array
+    // from the City Trial state 8003F670() (gm +394) + 0xC + slot x 0x24 - an address made by a call, not reached
+    // by the moves, so it read the old array: every stat its lowest (the game's machine stats screen showed 2 on
+    // every row whatever the patches; 801613FC reads them too). From there: the moved array.
+    if (rd32(0x8003F670) == 0x9421FFF0 && rd32(0x8000AB80) == 0x48034AF1)  // (bl 8003F670)
+        interpReplace(0, 0x8003F670, [](Ctx& c, u32 entry) {
+            const u32 from = c.lr;
+            interpOriginal(c, entry);
+            if (from == 0x8000AB84) c.r[3] = k_ct_ply_stats.to - 0xC;
+        });
     if (rd32(0x801210A8) == 0x9421FFE0)
         interpReplace(0, 0x801210A8, [](Ctx& c, u32 entry) {
             if (s32(c.r[3]) >= 6) return;
