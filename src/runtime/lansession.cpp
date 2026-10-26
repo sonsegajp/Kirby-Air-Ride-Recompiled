@@ -861,7 +861,9 @@ void resultsFrame(Ctx& c, u32 entry) {
             log("[solo] match %d over\n", s_solo.done + 1);
             if (++s_solo.done >= s_solo.matches) {
                 log("[solo] done: exiting\n");
-                std::exit(0);
+                // (no static destructors: the frontend's thread is still reading the controllers through Aurora)
+                std::fflush(stdout);
+                std::_Exit(0);
             }
         }
         return;

@@ -548,8 +548,20 @@ float xff(u32 a) { return __builtin_bit_cast(float, s_xf[a]); }
 enum : int { WIDE_CENTRE, WIDE_LEFT, WIDE_RIGHT, WIDE_STRETCH, WIDE_3D, WIDE_COVER };
 std::set<float> s_backdropDepths[2];  // depths of backdrop tiles in the previous and this frame
 std::vector<std::pair<u32, float>> s_bleed;  // the draw's vertices to move out: offset in its vertex data, new x
+// Menus in widescreen, by rule (no screen placed by hand): everything stays centred at its size, and a piece that reaches
+// a side of the 4:3 screen with a straight edge there - a band, a panel, a bar, a background layer - goes on to the wide
+// screen's side: a strip from its edge out, drawn with its outermost column (copies of its edge vertices, moved out:
+// colours and texture coordinates as at the edge, so a plain colour continues, a band's pattern runs on, and a shape
+// whose edge is transparent adds nothing). The strips' vertex data (triangles), drawn after the draw.
+std::vector<u8> s_smear;
+u32 s_smearCount = 0;
+std::vector<u8> s_smearPos;  // (indexed positions: the strips' own position array, s_arrayStride[0] apart)
 u32 s_zmode = 0;  // BP ZMODE (bit 0: depth test)
 u64 s_wideLogFrame = ~0ull, s_wideLogTo = 0;  // one frame, or 2D draws over a range of frames
+// SA2_WIDE_AUDIT=1 (test runs): every distinct drawing path whose draw is sized to the 4:3 screen - it reaches one of its
+// sides, and not far past - but is drawn at 4:3 in widescreen (centred, or 3D seen through the widened view) is logged
+// once: the effects that would show the 4:3 screen inside the wide one.
+const bool s_wideAudit = std::getenv("SA2_WIDE_AUDIT") != nullptr;
 
 // The game's HUD drawing routines, by the return addresses they leave on the stack (their 2D
 // moves to the screen edges in widescreen; everything else 2D stays centred), the routines that
@@ -579,6 +591,60 @@ bool drawingMap() {
         if (ret >= kMapCodeLo && ret < kMapCodeHi) return true;
     }
     return false;
+}
+
+// The heights of the thin strips (lines in pieces) on the 4:3 screen, this frame's and the last's: a strip wholly beside
+// the screen at one of them continues a line; others are pieces the game keeps out of sight.
+std::vector<std::pair<float, float>> s_lineStrips[2];
+u64 s_lineFrame = ~0ull;
+void lineFrame() {
+    if (s_lineFrame == s_frames) return;
+    s_lineStrips[1].swap(s_lineStrips[0]);
+    if (s_lineFrame + 1 != s_frames) s_lineStrips[1].clear();
+    s_lineStrips[0].clear();
+    s_lineFrame = s_frames;
+}
+void lineStrip(float y0, float y1) {
+    lineFrame();
+    s_lineStrips[0].push_back({y0, y1});
+}
+bool lineContinues(float y0, float y1) {
+    lineFrame();
+    for (const auto& lines : s_lineStrips)
+        for (auto [a, b] : lines)
+            if (std::fabs(a - y0) <= 3.f && std::fabs(b - y1) <= 3.f) return true;
+    return false;
+}
+
+// Whether the textures the draw uses are one colour down their first and last columns (each channel within a few
+// steps): a movie's plain backdrop. Read from guest memory (I8 and IA8: the movies' luma and chroma); other formats
+// count as not plain.
+bool edgesPlain() {
+    const u32 maps = std::min<u32>(s_genMode & 0xF, 4);
+    if (!maps) return false;
+    for (u32 m = 0; m < maps; m++) {
+        const u32 img0 = s_bp[0x88 + m], img3 = s_bp[0x94 + m];
+        const u32 w = (img0 & 0x3FF) + 1, h = ((img0 >> 10) & 0x3FF) + 1, fmt = (img0 >> 20) & 0xF;
+        const u32 base = (img3 & 0xFFFFFF) << 5;
+        if (fmt != 1 && fmt != 3) return false;
+        const u32 bytes = fmt == 1 ? ((w + 7) / 8) * ((h + 3) / 4) * 32 : ((w + 3) / 4) * ((h + 3) / 4) * 32;
+        if (!base || base + bytes > kMem1Size) return false;
+        const u8* t = hostp(0x80000000u | base);
+        for (u32 x : {0u, w - 1}) {
+            int lo[2] = {255, 255}, hi[2] = {0, 0};
+            for (u32 y = 0; y < h; y += 2) {
+                u8 c[2];
+                if (fmt == 1) c[0] = c[1] = t[((y / 4) * ((w + 7) / 8) + x / 8) * 32 + (y % 4) * 8 + x % 8];
+                else {
+                    const u8* q = t + ((y / 4) * ((w + 3) / 4) + x / 4) * 32 + ((y % 4) * 4 + x % 4) * 2;
+                    c[0] = q[0], c[1] = q[1];
+                }
+                for (int k = 0; k < 2; k++) lo[k] = std::min<int>(lo[k], c[k]), hi[k] = std::max<int>(hi[k], c[k]);
+            }
+            if (hi[0] - lo[0] > 8 || hi[1] - lo[1] > 8) return false;
+        }
+    }
+    return true;
 }
 
 bool s_stageHal2D = false;  // the draw being placed: through HAL's 2D camera, while a stage runs
@@ -642,10 +708,9 @@ void coveredPanel(float z, u32 tex) {
     if (!coveredPanelAt(z, tex)) s_panels.push_back({z, tex});
 }
 
-// Kirby Air Ride's menus in widescreen, placed by hand: everything stays centred at its size except
-// the parts listed here, which go flush with an edge of the wide screen. A screen is recognised by
-// one of its pieces (its box on the 4:3 screen and vertex count), seen this frame or the last; a
-// part is a box a piece lies within (or, exact, the piece's own box).
+// Kirby Air Ride's menu screens, recognised by one of their pieces (its box on the 4:3 screen and vertex count), seen
+// this frame or the last. (A layout's parts - boxes a piece lies within, or a piece's own box - would place pieces by
+// hand; none do: menus follow the general rules.)
 struct Box {
     float x0, x1, y0, y1;
     bool within(float a0, float a1, float b0, float b1) const { return a0 >= x0 && a1 <= x1 && b0 >= y0 && b1 <= y1; }
@@ -670,42 +735,15 @@ struct MenuLayout {
     std::vector<MenuPart> parts;
     bool strips = false;  // (its thin strips are parts too: the results' score capsules; else they stay as they are)
 };
+// The screens recognised, for the test runs' menu driving (SA2_MENU_SEQ) and the Online menu (gxMenuScreen). Their
+// pieces are placed by the general rules (place2D), not by hand: no parts.
 const std::vector<MenuLayout> kMenuLayouts = {
-    // Mode select (recognised by its movie preview's frame - the City Trial menu has the same bottom
-    // band): the right panel - it pulses, 273..758 to 283..748; its outline and shadow layers are a
-    // little bigger, from 241 - with the disc, the movie preview,
-    // Options and LAN on it, and the bottom band, flush right.
-    {"mode select", {392, 593, 235, 384}, 15,
-     {{{235, 800, 20, 550}, false, WIDE_RIGHT, 400},
-      {{330, 800, -90, 520}, false, WIDE_RIGHT},
-      {{300, 800, 100, 520}, false, WIDE_RIGHT},  // (Options highlighted is wider: from 309)
-      {{-158, 713, 231, 483}, true, WIDE_RIGHT},
-      {{-158, 678, 453, 516}, true, WIDE_STRETCH}}},  // (the bottom strip: one plain colour, spans the screen)
-    // City Trial menu (recognised by its bottom band): the right panel (its outline and shadow
-    // layers are a little bigger: 241..790) with the dark panel, the City Trial emblem and the disc on
-    // it, and the bottom band, flush right.
-    // The first of the LAN (Online) mode's screens, "How many Nintendo GameCube systems will you use to
-    // play?" (recognised by its third choice, "4"; nothing on it is moved): the Online menu opens on it
-    // (src/runtime/online_menu.cpp, gxMenuScreen).
+    {"mode select", {392, 593, 235, 384}, 15, {}},  // (its movie preview's frame)
+    // The first of the LAN (Online) mode's screens, "How many Nintendo GameCube systems will you use to play?" (its third
+    // choice, "4"): the Online menu opens on it (src/runtime/online_menu.cpp).
     {"lan systems", {310, 544, 314, 358}, 9, {}},
-    // (The Air Ride menu has the same band: its emblem - the circle, and Kirby beside it - goes right too.)
-    // A Stadium's results (recognised by its name's plate): the plate, the emblem ring and the rows - running off the
-    // 4:3 screen's right side - go flush right; the winner's card, with its place tab running off the left side, flush
-    // left; the dark band at the bottom runs out to the wide screen's right edge; the faint hexagons behind (a pattern
-    // of 102x83 tiles, which would part at the seam) are not drawn.
-    {"stadium results", {287, 646, 43, 127}, 7,
-     {{{-200, 900, -100, 600}, false, MENU_HIDE, 98, 106, 80, 87},
-      {{66, 659, 415, 511}, true, MENU_BLEED_R},
-      {{249, 673, 428, 498}, true, MENU_BLEED_R},
-      {{280, 1300, -80, 600}, false, WIDE_RIGHT},
-      {{-1300, 335, 60, 560}, false, WIDE_LEFT}},
-     true},
-    {"city trial menu", {-39, 677, 227, 483}, 93,
-     {{{235, 800, 20, 550}, false, WIDE_RIGHT, 400},
-      {{370, 800, 150, 480}, false, WIDE_RIGHT},
-      {{400, 820, -70, 530}, false, WIDE_RIGHT},
-      {{-39, 677, 227, 483}, true, WIDE_RIGHT},
-      {{-38, 678, 453, 516}, true, WIDE_STRETCH}}},  // (the bottom strip: one plain colour, spans the screen)
+    {"stadium results", {287, 646, 43, 127}, 7, {}},  // (its name's plate)
+    {"city trial menu", {-39, 677, 227, 483}, 93, {}},  // (its bottom band; the Air Ride and Top Ride menus have it too)
 };
 u64 s_layoutFrame = ~0ull;
 const MenuLayout* s_layoutNow = nullptr;   // recognised this frame
@@ -857,7 +895,7 @@ void place2D(const u8* p, u32 count, u32 fmt) {
     // Under a perspective projection, only Ninja's 2D matrix draws 2D: a draw whose first vertex
     // uses another matrix is 3D, without looking at its vertices - unless it is a single quad, which
     // may be a backdrop or screen effect filling the screen (below).
-    const bool logging = s_frames == s_wideLogFrame || (s_frames >= s_wideLogFrame && s_frames <= s_wideLogTo);
+    const bool logging = s_frames == s_wideLogFrame || (s_frames >= s_wideLogFrame && s_frames <= s_wideLogTo) || s_wideAudit;
     // Kirby Air Ride (HAL's engine) draws its menus, title and race HUD in perspective through one
     // 2D camera with a narrow view (projection scales 3.593 and 4.511): flat, they are 2D.
     const bool hal2D = !ortho && std::fabs(xff(0x1020) - 3.593f) < 0.01f && std::fabs(xff(0x1022) - 4.511f) < 0.01f;
@@ -892,10 +930,11 @@ void place2D(const u8* p, u32 count, u32 fmt) {
     float minx = 1e9f, maxx = -1e9f, miny = 1e9f, maxy = -1e9f, minz = 1e9f, maxz = -1e9f;
     bool ninja2D = true;
     s_bleed.clear();
-    float vxScreen[256], vxPerUnit[256];  // each vertex's screen x, and screen units per unit of its x
+    s_smear.clear(), s_smearCount = 0, s_smearPos.clear();
+    float vxScreen[256], vxPerUnit[256], vyScreen[256];  // each vertex's screen x, y, and screen units per unit of its x
     s32 vxIndex[256];                     // ... and its index in the position array (indexed positions; -1: none)
     for (u32 v = 0; v < count && v < 256; v++) {
-        vxScreen[v] = 1e9f, vxPerUnit[v] = 0.f, vxIndex[v] = -1;
+        vxScreen[v] = vyScreen[v] = 1e9f, vxPerUnit[v] = 0.f, vxIndex[v] = -1;
         const u8* vp = p + v * vsize;
         const u32 m = ((lo & 1) ? vp[0] : (s_cpMtxA & 0x3F)) * 4;  // matrix rows are 4 words
         if (m + 11 >= 0x100) continue;
@@ -918,7 +957,7 @@ void place2D(const u8* p, u32 count, u32 fmt) {
         static const int s_vtxLogCount = std::getenv("SA2_VTX_LOG") ? std::atoi(std::getenv("SA2_VTX_LOG")) : 0;  // (debugging)
         if (s_vtxLogCount && u32(s_vtxLogCount) == count && s_frames == s_wideLogFrame)
             log("[vtx] %u: obj %.2f %.2f %.2f screen %.1f %.1f (pos type %u fmt %u)\n", v, x, y, z, screenX, screenY, posType, cfmt);
-        vxScreen[v] = screenX;
+        vxScreen[v] = screenX, vyScreen[v] = screenY;
         vxPerUnit[v] = (ortho ? p0 : p0 / -ez) * xff(m) * sx;
         minx = std::min(minx, screenX);
         maxx = std::max(maxx, screenX);
@@ -957,6 +996,7 @@ void place2D(const u8* p, u32 count, u32 fmt) {
         // A piece of a bar that runs off the 4:3 screen: kept at its size, the end(s) past the screen moved out to the
         // wide screen's edge (below) - stretched, a shaped bar's notches and caps moved off the pieces beside them.
         int bleedSide = 0;  // -1 the left end, 1 the right, 2 both
+        int overhang = 0;   // a plain shape's part past this side (-1 left, 1 right) drawn out to the wide screen's
         // (a screen placed by hand places the pieces its HUD routines draw too, and its lettering through the
         // orthographic camera: the results' times and icons)
         const int part0 = hal2D || ortho ? menuPart(minx, maxx, miny, maxy, count, strip) : 0;
@@ -986,27 +1026,24 @@ void place2D(const u8* p, u32 count, u32 fmt) {
             // one depth) cover the screen together.
             else if (hal2D && textured && coveredPanelAt(minz, s_tex0))
                 place = WIDE_COVER;
-            // Its menus: the parts placed by hand (kMenuLayouts); the rest stays centred. A piece wholly
-            // beside the 4:3 screen is one the game keeps out of sight there (the mode select's wings,
-            // waiting off the left edge): the wide screen would show it, so it is not drawn.
+            // Its menus: centred, by the rules below and the strips (s_smear). A piece wholly beside the 4:3 screen is
+            // one the game keeps out of sight there (the mode select's wings waiting off the left edge, Player Entry's
+            // panels for players not in): the wide screen would show it, so it is not drawn - unless it is a piece of a
+            // line running on past the screen (a title line, in pieces: one at the same height is on the screen).
             else if (hal2D && !drawingHud(minx, maxx, ortho)) {
-                int part = strip ? 0 : menuPart(minx, maxx, miny, maxy, count);
-                if (part == MENU_BLEED_L || part == MENU_BLEED_R) bleedSide = part == MENU_BLEED_L ? -1 : 1, part = MENU_CLIP;  // (placed: no rule below)
-                place = part && part != MENU_CLIP ? part : WIDE_CENTRE;
-                if (!part && !strip && (maxx <= 0.f || minx >= 640.f)) s_hideDraw = true;
-                // A piece crossing one side of the 4:3 screen, there partly out of sight: the wide
-                // screen would show what the game keeps hidden past that edge (the Stadium card's
-                // scrolling title), so it is cut there - unless it is a panel sweeping across the
-                // whole screen (the shutter into Player Entry), which sweeps across the wide one.
+                place = WIDE_CENTRE;
+                if (strip && maxx > 0.f && minx < 640.f) lineStrip(miny, maxy);
+                if ((maxx <= 0.f || minx >= 640.f) && !(strip && lineContinues(miny, maxy))) s_hideDraw = true;
+                // A piece crossing one side of the 4:3 screen is shown past it, as the game drew it (the wide screen
+                // shows more of the menu). A plain shape (a background layer, a panel, a shutter sweeping across) has
+                // its part past the side drawn out to reach the wide screen's (remapOverhang, below: what is on the 4:3
+                // screen stays as it is); a picture with a straight edge there runs on in a strip (s_smear); a thin
+                // textured line running off one side (the title's Press Start capsule's edge lines) runs off the wide
+                // screen's.
                 const bool crossesL = minx < -2.f && maxx > 2.f && maxx < 638.f, crossesR = maxx > 642.f && minx < 638.f && minx > 2.f;
-                // A bar running off one side (the title's Press Start capsule: its body and its edge lines) runs off the
-                // wide screen's side instead.
-                if (!part && (crossesL || crossesR)) {
-                    // (a bar: wide - not a tile of a pattern, as the results' hexagons, 102 wide)
-                    if ((!textured && h < 300.f && w >= 150.f) || (textured && h <= 12.f)) bleedSide = crossesL ? -1 : 1;
-                    else if (strip) {}  // (a title line's piece: shown past the 4:3 screen as it is)
-                    else if (!textured) place = WIDE_STRETCH;  // a plain shape: one piece of a panel sweeping across
-                    else if (h < 200.f) s_clipDraw = true;  // (a picture bigger than that - a background - shows more of itself)
+                if (crossesL || crossesR) {
+                    if (!textured) overhang = crossesL ? -1 : 1;
+                    else if (h <= 12.f) bleedSide = crossesL ? -1 : 1;
                 }
             }
             // Backdrops: the farthest layers (sprite priority, as depth, 5000 or more). Nearer layers
@@ -1026,33 +1063,49 @@ void place2D(const u8* p, u32 count, u32 fmt) {
             // (Positions sent with the draw are changed in its copy of the commands; indexed ones in this frame's copy
             // of the position array, each once.)
             std::vector<s32> moved;
-            auto bleed = [&](float edge, float by) {
-                for (u32 v = 0; v < count && v < 256; v++) {
-                    if (std::fabs(vxScreen[v] - edge) >= 0.5f || std::fabs(vxPerUnit[v]) <= 1e-6f) continue;
-                    if (posType == 1) {
-                        if (cfmt != 4) continue;  // (moved as floats)
-                        const float x = comp(p + v * vsize + pre, 0);
-                        s_bleed.push_back({v * vsize + pre, x + by / vxPerUnit[v]});
-                    } else if (vxIndex[v] >= 0 && s_arrayCopy[0] && u32(vxIndex[v]) * s_arrayStride[0] + 4 <= s_arraySent[0] &&
-                               std::find(moved.begin(), moved.end(), vxIndex[v]) == moved.end()) {
-                        moved.push_back(vxIndex[v]);
-                        u8* q = s_arrayCopy[0] + u32(vxIndex[v]) * s_arrayStride[0];
-                        const float x = comp(q, 0) + by / vxPerUnit[v];
-                        if (cfmt == 4) {
-                            const u32 b = __builtin_bit_cast(u32, x);
-                            q[0] = u8(b >> 24), q[1] = u8(b >> 16), q[2] = u8(b >> 8), q[3] = u8(b);
-                        } else {  // fixed point, in its format (clamped)
-                            const float f = std::round(x / scale);
-                            if (cfmt == 0) q[0] = u8(std::clamp(f, 0.f, 255.f));
-                            else if (cfmt == 1) q[0] = u8(s8(std::clamp(f, -128.f, 127.f)));
-                            else {
-                                const u32 b = cfmt == 2 ? u32(std::clamp(f, 0.f, 65535.f)) : u32(u16(s16(std::clamp(f, -32768.f, 32767.f))));
-                                q[0] = u8(b >> 8), q[1] = u8(b);
-                            }
-                        }
-                    }
+            auto setX = [&](u8* q, float x) {  // a position's x, in its format
+                if (cfmt == 4) {
+                    const u32 b = __builtin_bit_cast(u32, x);
+                    q[0] = u8(b >> 24), q[1] = u8(b >> 16), q[2] = u8(b >> 8), q[3] = u8(b);
+                    return;
+                }
+                const float f = std::round(x / scale);  // fixed point (clamped)
+                if (cfmt == 0) q[0] = u8(std::clamp(f, 0.f, 255.f));
+                else if (cfmt == 1) q[0] = u8(s8(std::clamp(f, -128.f, 127.f)));
+                else {
+                    const u32 b = cfmt == 2 ? u32(std::clamp(f, 0.f, 65535.f)) : u32(u16(s16(std::clamp(f, -32768.f, 32767.f))));
+                    q[0] = u8(b >> 8), q[1] = u8(b);
                 }
             };
+            auto moveVertex = [&](u32 v, float by) {  // a vertex moved by `by` on the screen, sideways
+                if (std::fabs(vxPerUnit[v]) <= 1e-6f) return;
+                if (posType == 1) {
+                    if (cfmt != 4) return;  // (moved as floats)
+                    const float x = comp(p + v * vsize + pre, 0);
+                    s_bleed.push_back({v * vsize + pre, x + by / vxPerUnit[v]});
+                } else if (vxIndex[v] >= 0 && s_arrayCopy[0] && u32(vxIndex[v]) * s_arrayStride[0] + 4 <= s_arraySent[0] &&
+                           std::find(moved.begin(), moved.end(), vxIndex[v]) == moved.end()) {
+                    moved.push_back(vxIndex[v]);
+                    u8* q = s_arrayCopy[0] + u32(vxIndex[v]) * s_arrayStride[0];
+                    setX(q, comp(q, 0) + by / vxPerUnit[v]);
+                }
+            };
+            auto bleed = [&](float edge, float by) {
+                for (u32 v = 0; v < count && v < 256; v++)
+                    if (std::fabs(vxScreen[v] - edge) < 0.5f) moveVertex(v, by);
+            };
+            // The part of a plain shape past a side of the 4:3 screen, drawn out to reach the wide screen's side (each
+            // vertex past it moved out in proportion; what is on the 4:3 screen stays).
+            auto remapOverhang = [&](int side) {
+                const float over = side < 0 ? -minx : maxx - 640.f;
+                if (over <= 0.5f || over >= extra + 2.f) return;
+                const float k = (extra + 2.f) / over - 1.f;
+                for (u32 v = 0; v < count && v < 256; v++) {
+                    const float past = side < 0 ? std::min(vxScreen[v], 0.f) : std::max(vxScreen[v] - 640.f, 0.f);
+                    if (past != 0.f && vxScreen[v] < 1e8f) moveVertex(v, past * k);
+                }
+            };
+            if (overhang && place == WIDE_CENTRE && extra > 0.f && count <= 256) remapOverhang(overhang);
             if (bleedSide && place == WIDE_CENTRE && extra > 0.f && count <= 256) {
                 if (bleedSide != 1) bleed(minx, -(extra + 2.f));
                 if (bleedSide != -1) bleed(maxx, extra + 2.f);
@@ -1065,6 +1118,61 @@ void place2D(const u8* p, u32 count, u32 fmt) {
                      h >= 20.f && count <= 256) {
                 bleed(minx, -(extra + 2.f));
                 bleed(maxx, extra + 2.f);
+            }
+            // Menus: a piece reaching a side of the 4:3 screen with a straight edge runs on to the wide screen's side
+            // (s_smear).
+            const bool menu = (hal2D || ortho) && rd8(kGmScene) != 0x12;
+            // A picture covering the whole 4:3 screen drawn orthographically (Kirby Air Ride's movies: the logos, the
+            // intro, How to Play) runs on to the wide screen's sides only where its edges are one colour (the logos'
+            // plain backdrop); a picture with detail at its edges would streak, so it stays a 4:3 picture.
+            const bool fullPicture = ortho && textured && minx <= 2.f && maxx >= 638.f && miny <= 2.f && maxy >= 478.f;
+            const u32 stride0 = s_arrayStride[0];
+            const bool indexedOk = posType >= 2 && s_arrayCopy[0] && stride0 && stride0 <= 64;
+            if (menu && place == WIDE_CENTRE && !s_hideDraw && extra > 0.f && (posType == 1 || indexedOk) && count >= 3 && count <= 256 &&
+                s_bleed.empty() && moved.empty() && h >= 2.f && w >= 2.f && (!fullPicture || edgesPlain())) {
+                const u32 cull = (s_genMode >> 14) & 3;
+                // the draw's facing on the screen: its first triangle's winding (0: none to go by)
+                const float face = (vxScreen[1] - vxScreen[0]) * (vyScreen[2] - vyScreen[0]) - (vxScreen[2] - vxScreen[0]) * (vyScreen[1] - vyScreen[0]);
+                auto strip = [&](float edge, float to) {
+                    int top = -1, bot = -1;  // the edge's highest and lowest vertices
+                    for (u32 v = 0; v < count && v < 256; v++) {
+                        if (std::fabs(vxScreen[v] - edge) >= 0.5f || std::fabs(vxPerUnit[v]) <= 1e-6f) continue;
+                        if (posType >= 2 && (vxIndex[v] < 0 || u32(vxIndex[v]) * stride0 + stride0 > s_arraySent[0])) continue;
+                        if (top < 0 || vyScreen[v] < vyScreen[top]) top = int(v);
+                        if (bot < 0 || vyScreen[v] > vyScreen[bot]) bot = int(v);
+                    }
+                    // (straight: the edge's vertices span most of the piece's height - not a rounded or pointed end)
+                    if (top < 0 || vyScreen[bot] - vyScreen[top] < 0.6f * h) return;
+                    // A strip vertex: a copy of the edge vertex, moved out or not. Indexed positions go in the strips' own
+                    // little position array (s_smearPos), each vertex its own entry.
+                    auto vertex = [&](int v, bool out) {
+                        const size_t at = s_smear.size();
+                        s_smear.insert(s_smear.end(), p + size_t(v) * vsize, p + size_t(v + 1) * vsize);
+                        const float x = (to - vxScreen[v]) / vxPerUnit[v];
+                        if (posType == 1) {
+                            if (out) setX(s_smear.data() + at + pre, comp(p + size_t(v) * vsize + pre, 0) + x);
+                            return;
+                        }
+                        const u32 local = u32(s_smearPos.size() / stride0);
+                        const u8* src = s_arrayCopy[0] + u32(vxIndex[v]) * stride0;
+                        s_smearPos.insert(s_smearPos.end(), src, src + stride0);
+                        if (out) setX(s_smearPos.data() + local * stride0, comp(src, 0) + x);
+                        u8* idx = s_smear.data() + at + pre;
+                        if (posType == 2) idx[0] = u8(local);
+                        else idx[0] = u8(local >> 8), idx[1] = u8(local);
+                    };
+                    // (out-top, top, bottom) and (out-top, bottom, out-bottom), wound as the draw is if faces are culled
+                    const float mine = (edge - to) * (vyScreen[bot] - vyScreen[top]);
+                    const bool flip = cull != 0 && face != 0.f && (mine > 0.f) != (face > 0.f);
+                    for (int pass = 0; pass < (cull != 0 && face == 0.f ? 2 : 1); pass++) {
+                        const bool f = flip != (pass == 1);
+                        vertex(top, true), vertex(f ? bot : top, false), vertex(f ? top : bot, false);
+                        vertex(top, true), vertex(bot, f), vertex(bot, !f);
+                        s_smearCount += 6;
+                    }
+                };
+                if (minx <= 2.f && minx > -extra && maxx > 8.f) strip(minx, -(extra + 2.f));
+                if (maxx >= 638.f && maxx < 640.f + extra && minx < 632.f) strip(maxx, 640.f + extra + 2.f);
             }
         }
         if (s_frames == s_wideLogFrame || (s_frames >= s_wideLogFrame && s_frames <= s_wideLogTo && flat)) {
@@ -1081,11 +1189,36 @@ void place2D(const u8* p, u32 count, u32 fmt) {
                     chain += b;
                 }
             }
-            log("[wide] %llu %s draw: x %.0f..%.0f y %.0f..%.0f z %.2f..%.2f, %u verts, mtx %u [%.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g], zmode %x, tex %u @%08X%s -> %d; proj %.4g %.4g %.4g %.4g; stack%s\n",
-                (unsigned long long)s_frames, ortho ? "ortho" : "persp", minx, maxx, miny, maxy, minz, maxz, count, m / 4,
+            log("[wide] %llu %s draw: x %.0f..%.0f y %.0f..%.0f z %.2f..%.2f, %u verts (pos %u/%u%s), mtx %u [%.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g], zmode %x, tex %u @%08X%s -> %d%s%s%s; proj %.4g %.4g %.4g %.4g; stack%s\n",
+                (unsigned long long)s_frames, ortho ? "ortho" : "persp", minx, maxx, miny, maxy, minz, maxz, count, posType, cfmt,
+                s_smearCount ? " STRIPS" : "", m / 4,
                 xff(m), xff(m + 1), xff(m + 2), xff(m + 3), xff(m + 4), xff(m + 5), xff(m + 6), xff(m + 7), xff(m + 8),
                 xff(m + 9), xff(m + 10), xff(m + 11), s_zmode, s_genMode & 0xF, s_tex0, s_copyDests.count(s_tex0) ? " (copy)" : "", place,
-                p0, p1, p2, p3, chain.c_str());
+                s_hideDraw ? " HIDE" : "", s_clipDraw ? " CLIP" : "", s_bleed.empty() ? "" : " BLEED", p0, p1, p2, p3, chain.c_str());
+        }
+    }
+    if (s_wideAudit && minx <= maxx && !s_hideDraw && s_segmentAt != SIZE_MAX && s_out[s_segmentAt] == 1 &&
+        (place == WIDE_CENTRE || place == WIDE_3D) && (minx <= 2.f || maxx >= 638.f) && minx > -60.f && maxx < 700.f &&
+        maxy - miny >= 40.f) {
+        u32 chain[4] = {};
+        if (const Ctx* c = sched::currentCtx()) {
+            chain[0] = c->lr;
+            u32 sp = c->r[1];
+            for (int i = 1; i < 4 && (sp >> 25) == 0x40; i++) {
+                if (!(sp = rd32(sp))) break;
+                chain[i] = rd32(sp + 4);
+            }
+        }
+        const bool both = minx <= 2.f && maxx >= 638.f;
+        static std::set<u64> s_auditSeen;
+        const u64 key = (u64(chain[1]) << 32 | chain[2]) ^ (u64(chain[0]) * 0x9E3779B97F4A7C15ull) ^ u64(place) << 1 ^ u64(both);
+        if (s_auditSeen.size() < 400 && s_auditSeen.insert(key).second) {
+            const u32 m = ((lo & 1) ? p[0] : (s_cpMtxA & 0x3F)) * 4;
+            log("[wideaudit] frame %llu scene %02X %s %s: x %.0f..%.0f y %.0f..%.0f z %.1f..%.1f, %u verts, tex %u%s, mtx [%.3g %.3g %.3g | %.3g %.3g %.3g | %.3g %.3g %.3g], %s; from %08X %08X %08X %08X\n",
+                (unsigned long long)s_frames, rd8(kGmScene), place == WIDE_3D ? "3D" : "centred", both ? "BOTH sides" : "one side", minx, maxx,
+                miny, maxy, minz, maxz, count, s_genMode & 0xF, s_copyDests.count(s_tex0) ? " (copy)" : "", xff(m), xff(m + 1), xff(m + 2),
+                xff(m + 4), xff(m + 5), xff(m + 6), xff(m + 8), xff(m + 9), xff(m + 10), ortho ? "ortho" : hal2D ? "hal2D" : "persp", chain[0],
+                chain[1], chain[2], chain[3]);
         }
     }
     s_drawBox[0] = minx, s_drawBox[1] = maxx, s_drawBox[2] = miny, s_drawBox[3] = maxy;
@@ -1563,6 +1696,36 @@ size_t command(const u8* p, size_t n, int depth) {
                 put8(CMD_LOAD_BP);
                 put32(0x21u << 24 | (s_bp[0x21] & 0xFFFFFF));
             }
+            if (s_smearCount) {  // the strips running it on to the wide screen's sides (place2D), their texture clamped
+                const bool tex = s_genMode & 0xF;
+                if (tex) {
+                    put8(CMD_LOAD_BP);
+                    put32(0x80u << 24 | (s_bp[0x80] & 0xFFFFF0));
+                }
+                const bool ownPos = !s_smearPos.empty();
+                if (ownPos) {  // the strips' positions, for them alone (then the array again)
+                    u8* copy = s_arena.alloc(u32(s_smearPos.size()));
+                    std::memcpy(copy, s_smearPos.data(), s_smearPos.size());
+                    aurora(u16(AUR_ARRAYBASE | 0));
+                    put64(u64(reinterpret_cast<uintptr_t>(copy)));
+                    put32(u32(s_smearPos.size()));
+                    put8(0);
+                }
+                put8(u8(0x90 | (op & 7)));
+                put16(s_smearCount);
+                putBytes(s_smear.data(), s_smear.size());
+                if (ownPos) {
+                    aurora(u16(AUR_ARRAYBASE | 0));
+                    put64(u64(reinterpret_cast<uintptr_t>(s_arrayCopy[0])));
+                    put32(s_arraySent[0]);
+                    put8(0);
+                }
+                if (tex) {
+                    put8(CMD_LOAD_BP);
+                    put32(0x80u << 24 | (s_bp[0x80] & 0xFFFFFF));
+                }
+                s_smear.clear(), s_smearCount = 0, s_smearPos.clear();
+            }
             return len;
         }
         static int s_bad = 0;
@@ -1870,6 +2033,10 @@ void gxEndFrame() {
                 if (!s_sceneSince) s_sceneSince = s_frames;
                 if (c && s_wideLogFrame == ~0ull) s_wideLogFrame = s_sceneSince + std::strtoull(c + 1, nullptr, 10);
             } else s_sceneSince = 0;
+        } else if (wl[0] == 'e') {  // e<n>: every n-th game frame
+            const u64 n = std::max<u64>(1, std::strtoull(wl + 1, nullptr, 10));
+            s_wideLogFrame = (s_frames + n) / n * n;
+            if (s_frames % n == 0) s_wideLogFrame = s_frames;
         } else {
             s_wideLogFrame = std::strtoull(wl, nullptr, 10);
             if (const char* d = std::strchr(wl, '-')) s_wideLogTo = std::strtoull(d + 1, nullptr, 10);
