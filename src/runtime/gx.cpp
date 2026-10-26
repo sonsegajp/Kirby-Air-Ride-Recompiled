@@ -556,6 +556,8 @@ std::vector<std::pair<u32, float>> s_bleed;  // the draw's vertices to move out:
 std::vector<u8> s_smear;
 u32 s_smearCount = 0;
 std::vector<u8> s_smearPos;  // (indexed positions: the strips' own position array, s_arrayStride[0] apart)
+std::unordered_map<u64, u64> s_stripQuiet;  // pieces seen near a side without running on from it: no strips until that frame
+std::unordered_map<u64, u64> s_stripSeen;   // the last frame each piece ran on from a side
 u32 s_zmode = 0;  // BP ZMODE (bit 0: depth test)
 u64 s_wideLogFrame = ~0ull, s_wideLogTo = 0;  // one frame, or 2D draws over a range of frames
 // SA2_WIDE_AUDIT=1 (test runs): every distinct drawing path whose draw is sized to the 4:3 screen - it reaches one of its
@@ -1129,7 +1131,10 @@ void place2D(const u8* p, u32 count, u32 fmt) {
             const u32 stride0 = s_arrayStride[0];
             const bool indexedOk = posType >= 2 && s_arrayCopy[0] && stride0 && stride0 <= 64;
             if (menu && place == WIDE_CENTRE && !s_hideDraw && extra > 0.f && (posType == 1 || indexedOk) && count >= 3 && count <= 256 &&
-                s_bleed.empty() && moved.empty() && h >= 2.f && w >= 2.f && (!fullPicture || edgesPlain())) {
+                s_bleed.empty() && moved.empty() && h >= 2.f && w >= 2.f && (!fullPicture || edgesPlain()) &&
+                // (what runs on: a plain shape, a band, a layer - not a compact picture, as the mode select's spinning disc,
+                // whose edge column is a slice of its art)
+                (!textured || w >= 2.f * h || h >= 240.f)) {
                 const u32 cull = (s_genMode >> 14) & 3;
                 // the draw's facing on the screen: its first triangle's winding (0: none to go by)
                 const float face = (vxScreen[1] - vxScreen[0]) * (vyScreen[2] - vyScreen[0]) - (vxScreen[2] - vxScreen[0]) * (vyScreen[1] - vyScreen[0]);
@@ -1171,8 +1176,34 @@ void place2D(const u8* p, u32 count, u32 fmt) {
                         s_smearCount += 6;
                     }
                 };
-                if (minx <= 2.f && minx > -extra && maxx > 8.f) strip(minx, -(extra + 2.f));
-                if (maxx >= 638.f && maxx < 640.f + extra && minx < 632.f) strip(maxx, 640.f + extra + 2.f);
+                // A piece only now and then at a side - pulsing, spinning, sliding past - would flash its strip on and
+                // off: a piece seen near a side but not running on from it (its edge short of the side, or not straight)
+                // gets no strips for the next two seconds. (Known by its texture, vertex count, side and height.)
+                for (int side : {-1, 1}) {
+                    const bool nearSide = side < 0 ? minx < 40.f && minx > -extra && maxx > 8.f : maxx > 600.f && maxx < 640.f + extra && minx < 632.f;
+                    if (!nearSide) continue;
+                    const u64 key = mix(u64(s_tex0) << 20 ^ u64(count) << 4 ^ u64(side + 1) ^ u64(s32((miny + maxy) * (0.5f / 16.f))) << 52);
+                    const float edge = side < 0 ? minx : maxx;
+                    bool straight = side < 0 ? minx <= 2.f : maxx >= 638.f;
+                    if (straight) {
+                        float top = 1e9f, bot = -1e9f;
+                        for (u32 v = 0; v < count && v < 256; v++)
+                            if (std::fabs(vxScreen[v] - edge) < 0.5f) top = std::min(top, vyScreen[v]), bot = std::max(bot, vyScreen[v]);
+                        straight = bot - top >= 0.6f * h;
+                    }
+                    if (s_stripQuiet.size() > 4096) s_stripQuiet.clear();
+                    if (s_stripSeen.size() > 4096) s_stripSeen.clear();
+                    if (!straight) {
+                        s_stripQuiet[key] = s_frames + 120;
+                        continue;
+                    }
+                    if (const auto it = s_stripQuiet.find(key); it != s_stripQuiet.end() && it->second > s_frames) continue;
+                    // (and running on from it in the frame before too: not a piece passing by for a frame)
+                    u64& seen = s_stripSeen[key];
+                    const bool steady = seen + 1 >= s_frames;
+                    seen = s_frames;
+                    if (steady) strip(edge, side < 0 ? -(extra + 2.f) : 640.f + extra + 2.f);
+                }
             }
         }
         if (s_frames == s_wideLogFrame || (s_frames >= s_wideLogFrame && s_frames <= s_wideLogTo && flat)) {
