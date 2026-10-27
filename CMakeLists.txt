@@ -76,7 +76,21 @@ add_custom_command(OUTPUT ${_embed_out}
     DEPENDS tools/embed.cmake src/runtime/ctx.h src/runtime/modules.h src/runtime/abi.h src/game/glue.cpp
             config/GKYE01/names.txt config/GKYE01/patches_8p.txt
     COMMENT "Embedding the game module's sources in the program")
-add_executable(kirbyairride ${RUNTIME_SOURCES} ${SA2_EXTRA_SOURCES} ${_embed_out})
+# What the program is, to Windows: version information, its manifest and icon (res/kirbyairride.rc.in).
+set(_kar_rc)
+if (WIN32)
+    enable_language(RC)
+    set(KAR_MANIFEST "${CMAKE_SOURCE_DIR}/res/kirbyairride.manifest")
+    set(KAR_ICON "${CMAKE_SOURCE_DIR}/res/kirbyairride.ico")
+    string(REPLACE "/" "\\\\" KAR_MANIFEST "${KAR_MANIFEST}")
+    string(REPLACE "/" "\\\\" KAR_ICON "${KAR_ICON}")
+    configure_file(res/kirbyairride.rc.in ${CMAKE_BINARY_DIR}/generated/kirbyairride.rc @ONLY)
+    set(_kar_rc ${CMAKE_BINARY_DIR}/generated/kirbyairride.rc)
+endif ()
+add_executable(kirbyairride ${RUNTIME_SOURCES} ${SA2_EXTRA_SOURCES} ${_embed_out} ${_kar_rc})
+if (WIN32)
+    target_link_options(kirbyairride PRIVATE /MANIFEST:NO)  # (its own, from the resources)
+endif ()
 target_include_directories(kirbyairride PRIVATE src ${CMAKE_BINARY_DIR}/generated)
 set_target_properties(kirbyairride PROPERTIES ENABLE_EXPORTS ON)
 target_compile_options(kirbyairride PRIVATE /EHsc)

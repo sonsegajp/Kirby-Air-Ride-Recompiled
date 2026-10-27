@@ -1,3 +1,6 @@
 [submodule "extern/aurora"]
 	path = extern/aurora
 	url = https://github.com/encounter/aurora.git
+[submodule "extern/HSDLib"]
+	path = extern/HSDLib
+	url = https://github.com/Ploaj/HSDLib.git
