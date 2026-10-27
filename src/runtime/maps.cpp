@@ -3,6 +3,7 @@
 // code rather than from the stage files, is left out on such a map.
 #include "runtime/maps.h"
 #include "runtime/interp.h"
+#include "runtime/lansession.h"
 #include "runtime/mapfiles.h"
 #include "runtime/morepl.h"
 #include "runtime/runtime.h"
@@ -31,6 +32,9 @@ u32 dvdEntryNum(const std::string& path);
 void dvdUnserve(const std::vector<std::string>& paths);
 
 namespace {
+// A guest pointer: in MEM1 or the RAM above it (the stage's heap is there: ctx.h, kExtRamBase).
+inline bool guestPtr(u32 a) { return a >= 0x80000000u && a < 0x80000000u + kHostMemSize; }
+
 // The city's gimmicks (the wheel, its doors, the gates... 31 kinds), made one by one by the city's own setup: each takes
 // its joints in the city's model and its part of the city's collision, by number - none of which a custom map has.
 constexpr u32 kCityGimmicks = 0x8010F268;
@@ -79,6 +83,7 @@ struct Pending {
     float pos[3], fwd[3];
 } s_pending;             // the warp under way: the respawn's spot replaced by it
 int s_inArea = -1;       // the area the first rider is in (-1: none): its music plays
+int s_riderArea = -1;    // ... any area, music or not (-1: none): what lies in the others is not drawn
 
 void loadMapInfo(const std::string& dir) {
     s_areas.clear(), s_warps.clear();
@@ -132,9 +137,9 @@ int trackId(const std::string& name) {
 bool eventHasMusic() {
     if (rd8(kAudioFlags) & 0x08) return true;  // (Dragoon's music: the game's own lock)
     const u32 s = rd32(kEventState);
-    if ((s & 0xFE000000u) != 0x80000000u) return false;
+    if (!guestPtr(s)) return false;
     const u32 e = rd32(s + 0x2C);
-    return (e & 0xFE000000u) == 0x80000000u && rd32(e + 4) != 0;
+    return guestPtr(e) && rd32(e + 4) != 0;
 }
 void gcall(Ctx& c, u32 fn, u32 a0) {
     const u32 lr = c.lr;
@@ -285,9 +290,9 @@ void showMinimap(Ctx& c, int i) {
     const MinimapInfo& m = s_minimaps[size_t(i)];
     // the offset: in the stage node
     const u32 gp = rd32(c.r[13] + 0x5EC);
-    if ((gp & 0xFE000000u) == 0x80000000u) {
+    if (guestPtr(gp)) {
         const u32 st = rd32(rd32(gp + 8) + 4);
-        if ((st & 0xFE000000u) == 0x80000000u)
+        if (guestPtr(st))
             for (int k = 0; k < 3; k++) wr32(st + 0x64 + 4 * u32(k), bits32(m.offset[k]));
     }
     // the picture: in each HUD file loaded
@@ -326,11 +331,12 @@ struct RegionSave {
 
 void partsFrame(Ctx& c, const float pos[3]) {
     const u32 gp = rd32(c.r[13] + 0x5EC);
-    if ((gp & 0xFE000000u) != 0x80000000u) return;
+    if (!guestPtr(gp)) return;
     const u32 data = rd32(gp + 0xE4);
-    if ((data & 0xFE000000u) != 0x80000000u) return;
+    if (!guestPtr(data)) return;
     const u32 base = rd32(data), n = rd16(data + 4);
-    if ((base & 0xFE000000u) != 0x80000000u || n < 2 || n > 64) return;
+    if (static bool s_said = false; !s_said) s_said = true, log("[maps] the map's parts: bounding data %08X, regions %08X, %u of them\n", data, base, n);
+    if (!guestPtr(base) || n < 2 || n > 64) return;
     if (s_regions.data != data) {  // (a stage loaded: its regions as the file has them)
         s_regions = {};
         s_regions.data = data;
@@ -341,10 +347,7 @@ void partsFrame(Ctx& c, const float pos[3]) {
             s_regions.boxes.push_back(b);
         }
     }
-    const u32 st = rd32(rd32(gp + 8) + 4);
-    float scale = (st & 0xFE000000u) == 0x80000000u ? flt(rd32(st + 8)) : 1.f;
-    if (!(scale > 0.01f)) scale = 1.f;
-    const float x = pos[0] / scale, z = pos[2] / scale;  // (the rider in the world; the boxes in the file's units)
+    const float x = pos[0], z = pos[2];  // (the rider and the boxes both in the world's units: the game scales the boxes as it loads them)
     int active = -1;
     for (u32 k = 0; k < n && active < 0; k++) {
         const auto& b = s_regions.boxes[k];
@@ -367,6 +370,7 @@ void resetMatch() {
     std::memset(s_hasPrev, 0, sizeof s_hasPrev), std::memset(s_inWarp, 0, sizeof s_inWarp);
     s_pending = {};
     s_inArea = -1;
+    s_riderArea = -1;
     s_music = {};
     s_minimapShown = 0;
     s_hud[0] = s_hud[1] = {};
@@ -375,16 +379,49 @@ void resetMatch() {
         if (s_hudPatch[k].appliedAt != dvdLoadedAt(kHudFiles[k])) hudPatchApply(k, true);
 }
 
+// Whether the stage on now is the map's (its bounding data in the map's model file, where the game read it) - not
+// the Stadium that follows the city, which the map's areas, warps and parts have nothing to do with.
+// a point within an area across (its box turned by its yaw; any height)
+bool inAreaAcross(const AreaInfo& a, float x, float z) {
+    const float r = a.yaw * 3.14159265f / 180.f, cs = std::cos(r), sn = std::sin(r);
+    const float dx = x - a.c[0], dz = z - a.c[2];
+    return std::fabs(dx * cs - dz * sn) <= a.h[0] && std::fabs(dx * sn + dz * cs) <= a.h[2];
+}
+
+bool onMapStage(u32 bounding);
+// Whether a field object (an item box, an item, a parked machine) at x, z is in another area than the first rider's:
+// not drawn then (on the map's stage alone, and only while the rider is in an area).
+bool elsewhere(Ctx& c, float x, float z) {
+    if (!g_customCity.load() || s_riderArea < 0 || s_riderArea >= int(s_areas.size())) return false;
+    const u32 gp = rd32(c.r[13] + 0x5EC);
+    if (!onMapStage(guestPtr(gp) ? rd32(gp + 0xE4) : 0)) return false;
+    return !inAreaAcross(s_areas[size_t(s_riderArea)], x, z);
+}
+
+bool onMapStage(u32 bounding) {
+    u32 size = 0;
+    const u32 base = dvdOverlayLoadedAt("GrCity1Model.dat", &size);
+    return base && bounding >= base && bounding < base + size;
+}
+
 void riderFrame(Ctx& c, u32 slot) {
     if (!morepl::isRiderSlot(slot)) return;
+    // (this console's rider: what it sees - its area's parts, minimap, music - is this console's; in an online session
+    // each console rides the slot of its place in it)
+    const auto ls = lansession::status();
+    const u32 mine = ls.phase != lansession::Phase::Idle && ls.myConsole >= 0 ? u32(ls.myConsole) : 0u;
+    {
+        const u32 gp0 = rd32(c.r[13] + 0x5EC);
+        if (!onMapStage(guestPtr(gp0) ? rd32(gp0 + 0xE4) : 0)) return;
+    }
     {
         static u32 s_stage = 0;  // (the stage's bounding data: another one, another match)
         const u32 gp = rd32(c.r[13] + 0x5EC);
-        const u32 stage = (gp & 0xFE000000u) == 0x80000000u ? rd32(gp + 0xE4) : 0;
+        const u32 stage = guestPtr(gp) ? rd32(gp + 0xE4) : 0;
         if (stage != s_stage) {
             s_stage = stage, resetMatch();
             if (std::getenv("SA2_MAP_TREELOG")) {
-                const u32 g = rd32(c.r[13] + 0x5EC), t = (g & 0xFE000000u) == 0x80000000u ? rd32(g + 0x700) : 0;
+                const u32 g = rd32(c.r[13] + 0x5EC), t = guestPtr(g) ? rd32(g + 0x700) : 0;
                 log("[maps] tree %08X: +54 %08X +58 %04X (iterator %08X)\n", t, t ? rd32(t + 0x54) : 0, t ? rd16(t + 0x58) : 0, g ? rd32(g + 0x704) : 0);
             }
             if (std::getenv("SA2_MAP_PRELOADSCAN")) {  // (debugging: where the game keeps the stage files' places)
@@ -402,9 +439,9 @@ void riderFrame(Ctx& c, u32 slot) {
     const u32 p = morepl::at(morepl::k_ptab, slot);
     if (rd32(p) == 4) return;  // (no rider in this slot)
     const u32 mg = rd32(p + 0x40);
-    if ((mg & 0xFE000000u) != 0x80000000u) return;
+    if (!guestPtr(mg)) return;
     const u32 md = rd32(mg + 0x2C);
-    if ((md & 0xFE000000u) != 0x80000000u) return;
+    if (!guestPtr(md)) return;
     const float pos[3] = {flt(rd32(md + 0x3E8)), flt(rd32(md + 0x3EC)), flt(rd32(md + 0x3F0))};
     const u32 frame = ++s_frame[slot];
     if (slot == 0 && (frame == 1 || frame % 600 == 0))
@@ -450,21 +487,28 @@ void riderFrame(Ctx& c, u32 slot) {
                 log("[maps] rider %u warped by %s to %.0f %.0f %.0f\n", slot, w.name.c_str(), w.to[0], w.to[1], w.to[2]);
                 break;
             }
-    if (slot == 0) minimapFrame(c, pos), partsFrame(c, pos);
+    if (slot == mine) minimapFrame(c, pos), partsFrame(c, pos);
     if (slot == 0) {  // (City Trial's events, as they change: finding which one a custom map can't take)
         static u32 s_lastState = ~0u;
         const u32 s = rd32(kEventState);
-        if ((s & 0xFE000000u) == 0x80000000u) {
+        if (guestPtr(s)) {
             const u32 e = rd32(s + 0x2C);
-            if ((e & 0xFE000000u) == 0x80000000u && rd32(e + 4) != s_lastState) {
+            if (guestPtr(e) && rd32(e + 4) != s_lastState) {
                 s_lastState = rd32(e + 4);
                 log("[maps] event state %u: %08X %08X %08X %08X %08X %08X %08X %08X\n", s_lastState, rd32(e), rd32(e + 4), rd32(e + 8), rd32(e + 12),
                     rd32(e + 16), rd32(e + 20), rd32(e + 24), rd32(e + 28));
             }
         }
     }
+    // the area the first rider is in, across (heights aside): what is in the others - boxes, items, machines - not drawn
+    if (slot == mine) {
+        int in = -1;
+        for (size_t i = 0; i < s_areas.size() && in < 0; i++)
+            if (inAreaAcross(s_areas[i], pos[0], pos[2])) in = int(i);
+        s_riderArea = in;
+    }
     // areas: the first rider's decides the music
-    if (slot == 0 && !s_areas.empty()) {
+    if (slot == mine && !s_areas.empty()) {
         int in = -1;
         for (size_t i = 0; i < s_areas.size(); i++)
             if (s_areas[i].track != "-" && s_areas[i].contains(pos)) {
@@ -673,14 +717,14 @@ void mapsInit() {
             const u32 mark = c.r[3];
             interpOriginal(c, entry);
             if (static int s_n = 0; std::getenv("SA2_MAP_TREELOG") && s_n++ % 3000 == 0) {
-                const u32 g = rd32(c.r[13] + 0x5EC), t = (g & 0xFE000000u) == 0x80000000u ? rd32(g + 0x700) : 0;
+                const u32 g = rd32(c.r[13] + 0x5EC), t = guestPtr(g) ? rd32(g + 0x700) : 0;
                 log("[maps] tree %08X: +54 %08X +58 %04X (custom %d)\n", t, t ? rd32(t + 0x54) : 0, t ? rd16(t + 0x58) : 0, int(g_customCity.load()));
             }
             if (!g_customCity.load() || (s_warps.empty() && s_areas.empty() && s_minimaps.size() < 2)) return;
             const u32 d = rd32(mark + 0x2C);
             static bool s_said = false;
             if (!s_said) s_said = true, log("[maps] the riders' minimap marks: areas and warps checked from here (mark data %08X, slot %u)\n", d, d ? rd32(d + 0x20) : 0);
-            if ((d & 0xFE000000u) == 0x80000000u) riderFrame(c, rd32(d + 0x20));
+            if (guestPtr(d)) riderFrame(c, rd32(d + 0x20));
         }))
         log("[maps] areas and warps: checked as the minimap's marks move\n");
     if (rd32(kPutMachine) == 0x9421FFB0)
@@ -692,6 +736,22 @@ void mapsInit() {
                     wr32(c.r[6] + 4 * u32(i), bits32(i == 1 ? 1.f : 0.f));
                 }
             }
+            interpOriginal(c, entry);
+        });
+    // What lies in other areas than the first rider's, not drawn: items and their boxes (GObj p_link 0xD, drawn by
+    // 8024FCE0(gobj, pass); its data +DC the position) and machines no one rides (p_link 9, 801C6E84; +3E8 the position,
+    // +4 the rider). Pass 3 is no drawing (it marks what the camera sees): left to run.
+    constexpr u32 kItemDraw = 0x8024FCE0, kMachineDraw = 0x801C6E84;
+    if (rd32(kItemDraw) == 0x9421FFE0)
+        interpReplace(0, kItemDraw, [](Ctx& c, u32 entry) {
+            const u32 ud = guestPtr(c.r[3]) ? rd32(c.r[3] + 0x2C) : 0;
+            if (c.r[4] != 3 && guestPtr(ud) && elsewhere(c, flt(rd32(ud + 0xDC)), flt(rd32(ud + 0xE4)))) return;
+            interpOriginal(c, entry);
+        });
+    if (rd32(kMachineDraw) == 0x9421FF70)
+        interpReplace(0, kMachineDraw, [](Ctx& c, u32 entry) {
+            const u32 md = guestPtr(c.r[3]) ? rd32(c.r[3] + 0x2C) : 0;
+            if (c.r[4] != 3 && guestPtr(md) && rd32(md + 4) == 0 && elsewhere(c, flt(rd32(md + 0x3E8)), flt(rd32(md + 0x3F0)))) return;
             interpOriginal(c, entry);
         });
     if (rd32(kCityGimmicks) == 0x9421FFF0)  // (stwu r1,-16(r1): the function as the program has it)
