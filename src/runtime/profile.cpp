@@ -68,6 +68,7 @@ void reportWaits(std::map<std::vector<u64>, u32>& waits, u64 total) {
 
 void report(std::unordered_map<u64, u32>& hits, u64 total) {
     symInit();
+    SymRefreshModuleList(GetCurrentProcess());  // (the game's module, loaded since)
     std::map<std::string, u32> byName;
     for (auto& [rip, n] : hits) byName[symName(rip)] += n;
     std::vector<std::pair<u32, std::string>> top;
@@ -96,6 +97,17 @@ void profilerMain(int seconds) {
     const u64 lo = reinterpret_cast<u64>(exe);
     IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<u8*>(exe) + reinterpret_cast<IMAGE_DOS_HEADER*>(exe)->e_lfanew);
     const u64 hi = lo + nt->OptionalHeader.SizeOfImage;
+    // (the game's module too - its code is the game's: kirbyairride_game.dll, loaded after this starts)
+    u64 glo = 0, ghi = 0;
+    auto gameRange = [&] {
+        if (glo) return;
+        HMODULE g = GetModuleHandleA("kirbyairride_game.dll");
+        if (!g) g = GetModuleHandleA("kirbyairride_game_8p.dll");
+        if (!g) return;
+        auto* gnt = reinterpret_cast<IMAGE_NT_HEADERS*>(reinterpret_cast<u8*>(g) + reinterpret_cast<IMAGE_DOS_HEADER*>(g)->e_lfanew);
+        glo = reinterpret_cast<u64>(g), ghi = glo + gnt->OptionalHeader.SizeOfImage;
+    };
+    auto counted = [&](u64 rip) { return (rip >= lo && rip < hi) || (rip >= glo && rip < ghi); };
     std::unordered_map<u64, u32> hits;
     std::map<std::vector<u64>, u32> waits;
     u64 total = 0, waitTotal = 0;
@@ -103,6 +115,7 @@ void profilerMain(int seconds) {
     auto last = GetTickCount64();
     for (;;) {
         Sleep(1);
+        gameRange();
         std::vector<HANDLE> threads;
         {
             std::lock_guard g(s_lock);
@@ -114,7 +127,7 @@ void profilerMain(int seconds) {
             if (SuspendThread(h) == DWORD(-1)) continue;
             const bool ok = GetThreadContext(h, &ctx);
             u64 chain[6] = {};
-            if (ok && s_waits && (ctx.Rip < lo || ctx.Rip >= hi)) {
+            if (ok && s_waits && !counted(ctx.Rip)) {
                 // Waiting: walk the stack (while the thread is stopped) to the first frames in kirbyairride.exe.
                 STACKFRAME64 f{};
                 f.AddrPC = {ctx.Rip, 0, AddrModeFlat};
@@ -130,7 +143,7 @@ void profilerMain(int seconds) {
             }
             ResumeThread(h);
             if (!ok) continue;
-            if (ctx.Rip < lo || ctx.Rip >= hi) {  // waiting, or in a system DLL
+            if (!counted(ctx.Rip)) {  // waiting, or in a system DLL
                 if (chain[0]) {
                     waits[std::vector<u64>(chain, chain + 6)]++;
                     waitTotal++;

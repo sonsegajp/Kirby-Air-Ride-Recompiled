@@ -134,7 +134,8 @@ u16 scriptedButtons() {
                 const std::string b = t.substr(0, k);
                 const u16 mask = b == "A" ? PAD_BUTTON_A : b == "B" ? PAD_BUTTON_B : b == "START" ? PAD_BUTTON_START
                                : b == "UP" ? PAD_BUTTON_UP : b == "DOWN" ? PAD_BUTTON_DOWN : b == "LEFT" ? PAD_BUTTON_LEFT
-                               : b == "RIGHT" ? PAD_BUTTON_RIGHT : b == "X" ? PAD_BUTTON_X : b == "Y" ? PAD_BUTTON_Y : 0;
+                               : b == "RIGHT" ? PAD_BUTTON_RIGHT : b == "X" ? PAD_BUTTON_X : b == "Y" ? PAD_BUTTON_Y
+                               : b == "Z" ? PAD_TRIGGER_Z : 0;
                 v.push_back({mask, k == std::string::npos ? ' ' : t[k], k == std::string::npos ? "" : t.substr(k + 1)});
                 if (!e) break;
                 p = e + 1;

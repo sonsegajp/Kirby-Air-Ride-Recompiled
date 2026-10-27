@@ -36,6 +36,9 @@ extern std::atomic<float> masterVolume;  // 0..1
 extern std::atomic<bool> muteUnfocused;  // silent while the window is in the background
 // Interface
 extern std::atomic<bool> menuHint;       // "F1: Menu" shown at start
+// City Trial
+extern Text cityMap;                     // the map played in the city's place: a map mod's folder (mods/maps/<folder>);
+                                         // empty: the city itself
 // Online (src/runtime/airnet.cpp)
 extern Text onlineMaster;                // the master server, "host" or "host:port"
 extern Text onlineServer;                // a dedicated server chosen instead (the same server software, run by

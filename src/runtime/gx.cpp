@@ -100,7 +100,7 @@ void aurora(u16 sub) {
     put8(CMD_AURORA);
     put16(sub);
 }
-u64 hostAddr(u32 physAddr) { return u64(reinterpret_cast<uintptr_t>(hostp(0x80000000u | (physAddr & 0x01FFFFFF)))); }
+u64 hostAddr(u32 physAddr) { return u64(reinterpret_cast<uintptr_t>(hostp(0x80000000u | (physAddr & kHostMemMask)))); }
 
 // ---- CP vertex format state (for command lengths) ----
 u32 s_vcdLo = 0, s_vcdHi = 0, s_vatA[8], s_vatB[8], s_vatC[8];
@@ -242,7 +242,7 @@ std::unordered_map<u64, ArraySnap> s_arraySnaps;  // (slot, stride, base) -> thi
 u8* s_arrayCopy[16];   // the current base's snapshot (none yet: null)
 u8* s_arrayShown[16];  // the snapshot Aurora has for the slot
 
-u64 arraySnapKey(u32 i) { return u64(i) << 56 | u64(s_arrayStride[i]) << 32 | (s_arrayBase[i] & 0x01FFFFFF); }
+u64 arraySnapKey(u32 i) { return u64(i) << 56 | u64(s_arrayStride[i]) << 32 | (s_arrayBase[i] & kHostMemMask); }
 
 // The slot's base or stride changed: its snapshot this frame, if it has one.
 void arrayBaseChanged(u32 i) {
@@ -277,11 +277,11 @@ void needArray(u32 i, u32 bytes, u32 vat = 0) {
         if (s_arrayShown[i] != s_arrayCopy[i]) sendArray(i, s_arrayCopy[i], s_arraySent[i], vat);  // (back to it)
         return;
     }
-    const u32 limit = kHostMemSize - (s_arrayBase[i] & 0x01FFFFFF);
+    const u32 limit = kHostMemSize - (s_arrayBase[i] & kHostMemMask);
     const u32 size = std::min((std::max(bytes, s_arraySent[i] * 2) + 63) & ~63u, limit);
     s_arraySent[i] = size;
     u8* copy = s_arena.alloc(size);
-    std::memcpy(copy, hostp(0x80000000u | (s_arrayBase[i] & 0x01FFFFFF)), size);
+    std::memcpy(copy, hostp(0x80000000u | (s_arrayBase[i] & kHostMemMask)), size);
     s_arrayCopy[i] = copy;
     s_arraySnaps[arraySnapKey(i)] = {copy, size};
     sendArray(i, copy, size, vat);
@@ -462,7 +462,7 @@ u64 textureSource(u32 image3, u32 fmt, u32 w, u32 h) {
         if (hash == kLanEmblemHash) return u64(reinterpret_cast<uintptr_t>(kOnlineEmblem));
         if (hash == kLanLetteringHash) return u64(reinterpret_cast<uintptr_t>(kOnlineLettering));
     }
-    return hostAddr(addr & 0x01FFFFFF);
+    return hostAddr(addr & kHostMemMask);
 }
 
 void loadTexture(int map, u32 image3) {
@@ -477,7 +477,7 @@ void loadTexture(int map, u32 image3) {
         static std::set<u32> s_dumped;
         const u32 addr = 0x80000000u | ((image3 & 0x00FFFFFF) << 5);
         char key[16];
-        std::snprintf(key, sizeof key, "%08X", addr & 0x01FFFFFF);
+        std::snprintf(key, sizeof key, "%08X", addr & kHostMemMask);
         if ((!std::strcmp(s_texDump, "all") || std::strstr(s_texDump, key + 2)) && s_dumped.insert(addr).second) {
             char name[96];
             std::snprintf(name, sizeof name, "tex_%s_%ux%u_f%X.bin", key + 2, w, h, fmt);
@@ -630,7 +630,7 @@ bool edgesPlain() {
         const u32 base = (img3 & 0xFFFFFF) << 5;
         if (fmt != 1 && fmt != 3) return false;
         const u32 bytes = fmt == 1 ? ((w + 7) / 8) * ((h + 3) / 4) * 32 : ((w + 3) / 4) * ((h + 3) / 4) * 32;
-        if (!base || base + bytes > kMem1Size) return false;
+        if (!base || base + bytes > kHostMemSize) return false;
         const u8* t = hostp(0x80000000u | base);
         for (u32 x : {0u, w - 1}) {
             int lo[2] = {255, 255}, hi[2] = {0, 0};
@@ -943,7 +943,7 @@ void place2D(const u8* p, u32 count, u32 fmt) {
         const u8* pos = vp + pre;
         if (posType >= 2) {
             const u32 idx = posType == 2 ? pos[0] : u32(pos[0]) << 8 | pos[1];
-            pos = hostp(0x80000000u | ((s_arrayBase[0] + idx * s_arrayStride[0]) & 0x01FFFFFF));
+            pos = hostp(0x80000000u | ((s_arrayBase[0] + idx * s_arrayStride[0]) & kHostMemMask));
             vxIndex[v] = s32(idx);
         }
         ninja2D = ninja2D && ninja2DMatrix(m);
@@ -1441,12 +1441,12 @@ bool spriteWithinTexture(const u8* p, u32 count, u32 fmt) {
 void nameDraw(const u8* p, u32 fmt) {
     if (s_noRecord) return;
     u64 part = 0;
-    if (s_curDl) part = u64(s_curDl & 0x01FFFFFF) << 1 | 1;
+    if (s_curDl) part = u64(s_curDl & kHostMemMask) << 1 | 1;
     else if (const u32 posType = (s_vcdLo >> 9) & 3; posType >= 2) {
         u32 pre = 0;
         for (u32 i = 0; i < 9; i++) pre += (s_vcdLo >> i) & 1;
         const u32 idx = posType == 2 ? p[pre] : u32(p[pre]) << 8 | p[pre + 1];
-        part = (u64(s_arrayBase[0] & 0x01FFFFFF) << 24 | idx) << 1;
+        part = (u64(s_arrayBase[0] & kHostMemMask) << 24 | idx) << 1;
     } else {
         // Positions sent with the draw (particles, effects): no lasting part, so draws of one
         // vertex format in the object count as copies of one part - paired by position.
@@ -1607,7 +1607,7 @@ size_t command(const u8* p, size_t n, int depth) {
         put16(xa);
         recordXf(xa, count, u32(s_out.size()));
         for (u32 i = 0; i < count; i++) {
-            const u32 w = rd32(0x80000000u | ((src + i * 4) & 0x01FFFFFF));
+            const u32 w = rd32(0x80000000u | ((src + i * 4) & kHostMemMask));
             if (xa + i < 0x1058) s_xf[xa + i] = w, s_xfSet.set(xa + i);
             put32(w);
         }
@@ -1619,12 +1619,12 @@ size_t command(const u8* p, size_t n, int depth) {
         const u32 outer = s_curDl;
         s_curDl = addr;
         // A list recorded under a scope (gxHeightFieldEnter...) plays under it.
-        const u32 a = 0x80000000u | (addr & 0x01FFFFFF);
+        const u32 a = 0x80000000u | (addr & kHostMemMask);
         int height = 0, staticV = 0;
         for (const ScopedDl& d : s_scopedDls)
             if (a >= d.lo && a < d.hi) height += d.height, staticV += d.staticV || d.height;
         s_heightField += height, s_staticVertices += staticV;
-        if (depth < 4) parse(hostp(0x80000000u | (addr & 0x01FFFFFF)), size, depth + 1);
+        if (depth < 4) parse(hostp(0x80000000u | (addr & kHostMemMask)), size, depth + 1);
         s_heightField -= height, s_staticVertices -= staticV;
         s_curDl = outer;
         return 9;
@@ -1810,7 +1810,7 @@ void gxWrite(u32 v, int size) {
         u32 wp = raw & 0x03FFFFFF, wrapped = raw & 0x04000000;
         const u32 base = rd32(0xCC00300C) & 0x03FFFFFF, end = rd32(0xCC003010) & 0x03FFFFFF;
         for (int i = size - 1; i >= 0; i--) {
-            *hostp(0x80000000u | (wp++ & 0x01FFFFFF)) = u8(v >> (8 * i));
+            *hostp(0x80000000u | (wp++ & kHostMemMask)) = u8(v >> (8 * i));
             if (end && wp > end) {
                 wp = base;
                 static int s_logged = 0;
@@ -1853,7 +1853,7 @@ void gxViewMatrixAt(u32 addr) {
 // the list, to its playback.
 namespace {
 std::vector<u32> s_scopeDlStart;  // per open scope: where the CPU FIFO was writing (0: not recording)
-u32 fifoWritePtr() { return 0x80000000u | (rd32(0xCC003014) & 0x01FFFFFF); }
+u32 fifoWritePtr() { return 0x80000000u | (rd32(0xCC003014) & kHostMemMask); }
 void scopeEnter() { s_scopeDlStart.push_back(redirectedToMemory() ? fifoWritePtr() : 0); }
 void scopeLeave(bool height) {
     const u32 start = s_scopeDlStart.empty() ? 0 : s_scopeDlStart.back();

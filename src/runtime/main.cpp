@@ -85,6 +85,7 @@ bool loadGameModule(bool eightRiders, std::string& error);  // src/runtime/game.
 void gameModuleMemory();             // src/runtime/game.cpp
 bool setupScreen(const std::filesystem::path& exeDir, std::string& disc, bool eightRiders, std::string error);  // setupscreen.cpp
 extern bool (*g_beforeGame)();       // src/runtime/frontend.cpp
+void mapsInit();                     // src/runtime/maps.cpp
 }
 
 namespace {
@@ -139,6 +140,7 @@ bool bootGame(std::string& error) {
     resolveHooks();
     interpInit();
     gameFixesInit();
+    mapsInit();
     if (const char* w = std::getenv("SA2_WATCH")) {  // SA2_WATCH=<hex address>[:<length>]
         const char* colon = std::strchr(w, ':');
         installWatch(u32(std::strtoul(w, nullptr, 16)), colon ? u32(std::strtoul(colon + 1, nullptr, 0)) : 4);

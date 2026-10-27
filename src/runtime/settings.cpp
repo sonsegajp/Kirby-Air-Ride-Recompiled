@@ -17,6 +17,7 @@ std::atomic<bool> widescreen{true};
 std::atomic<float> masterVolume{1.f};
 std::atomic<bool> muteUnfocused{false};
 std::atomic<bool> menuHint{true};
+Text cityMap{""};
 #ifndef KAR_ONLINE_MASTER
 #define KAR_ONLINE_MASTER ""
 #endif
@@ -48,6 +49,7 @@ const Entry kEntries[] = {
     {"master_volume", nullptr, nullptr, &masterVolume},
     {"mute_unfocused", &muteUnfocused, nullptr, nullptr},
     {"menu_hint", &menuHint, nullptr, nullptr},
+    {"city_map", nullptr, nullptr, nullptr, &cityMap},
     {"online_master", nullptr, nullptr, nullptr, &onlineMaster},
     {"online_user", nullptr, nullptr, nullptr, &onlineUser},
     {"online_server", nullptr, nullptr, nullptr, &onlineServer},

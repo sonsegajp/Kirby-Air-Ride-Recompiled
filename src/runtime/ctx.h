@@ -45,8 +45,12 @@ constexpr u32 kMem1Size = 0x01800000;
 constexpr u32 kLockedCache = 0x01800000;  // host offset of the 16 KiB locked cache
 // Host window: masked guest addresses must always land inside the allocation (the mask and the
 // buffer size are the same number: a 32 MiB mask over a 24 MiB buffer once wrote past the heap).
-constexpr u32 kHostMemSize = 0x02000000;
+// 64 MiB: MEM1 (24), the runtime's own objects (to 32), then more RAM than the console had for the stage's files - so a
+// custom map's are not held to the city's sizes (src/runtime/maps.cpp moves the stage's heap there).
+constexpr u32 kHostMemSize = 0x04000000;
 constexpr u32 kHostMemMask = kHostMemSize - 1;
+constexpr u32 kExtRamBase = 0x02000000;  // (physical: guest 0x82000000)
+constexpr u32 kExtRamSize = 0x02000000;
 
 extern u8* g_mem;  // (each side has its own copy of the base: it never changes once allocated)
 #if defined(KAR_GAME_DLL)

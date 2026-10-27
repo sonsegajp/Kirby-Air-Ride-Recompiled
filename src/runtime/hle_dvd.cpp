@@ -29,6 +29,7 @@
 
 namespace rt {
 u64 gxFrames();  // src/runtime/gx.cpp
+extern std::atomic<bool> g_customCity;  // src/runtime/maps.cpp
 std::atomic<u32> g_dvdGatePending{0};  // a held read issued and not yet ended for the game (below)
 
 namespace {
@@ -96,8 +97,36 @@ void gateEnded(u64 gseq) {  // (under s_gate.m)
     s_gate.cv.notify_all();
 }
 
+// Files served in place of the disc's (City Trial maps: dvdOverlay below): the FST entry of each points past the end
+// of the disc, to its data here.
+constexpr u32 kOverlayBase = 0xA0000000u;  // (a disc is 1.4 GB: well below)
+struct Overlay {
+    u32 at;
+    std::vector<u8> data;
+    std::string path;
+    u32 loadedAt = 0;  // where the game last read its start into (its guest address; 0: not read)
+};
+std::vector<Overlay> s_overlays;  // (under s_discLock)
+u32 s_overlayNext = kOverlayBase;
+struct Watched {  // a disc file whose place in guest memory is wanted (dvdWatch)
+    std::string path;
+    u64 offset;
+    u32 loadedAt = 0;
+};
+std::vector<Watched> s_watched;  // (under s_discLock)
+
 bool readRaw(u64 offset, void* dst, u32 len) {
     std::lock_guard g(s_discLock);
+    if (offset >= kOverlayBase) {
+        for (const Overlay& o : s_overlays)
+            if (offset >= o.at && offset < o.at + ((o.data.size() + 0x7FFF) & ~size_t(0x7FFF))) {
+                const size_t from = size_t(offset - o.at), n = from < o.data.size() ? std::min<size_t>(len, o.data.size() - from) : 0;
+                if (n) std::memcpy(dst, o.data.data() + from, n);
+                if (n < len) std::memset(static_cast<u8*>(dst) + n, 0, len - n);  // (the padding after the file)
+                return true;
+            }
+        return false;
+    }
     return s_disc && s_disc->read(offset, dst, len);
 }
 
@@ -298,6 +327,10 @@ void worker() {
         const double start = std::max(hostSeconds(), s_drive.busyUntil);
         const double done = fastDisc() ? start + 0.0005 + r.length / 16e6 : s_drive.read(r.offset, r.length, start);
         s_drive.busyUntil = done;
+        if (const double late = done - hostSeconds(); late > 0.5) {
+            static int s_n = 0;
+            if (s_n++ < 40) log("[dvd] read %llX (%u bytes) done in %.2f s (drive busy until then)\n", (unsigned long long)r.offset, r.length, late);
+        }
         sleepUntil(s_clock0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(done)), false);
         {
             std::lock_guard g(s_seqLock);
@@ -306,6 +339,16 @@ void worker() {
                 continue;
             }
             if (ok) std::memcpy(hostp(r.addr), buf.data(), r.length);
+            if (ok && r.offset >= kOverlayBase) {  // (a served file's start read: where it is, for its users)
+                std::lock_guard g2(s_discLock);
+                for (Overlay& o : s_overlays)
+                    if (o.at == r.offset) o.loadedAt = r.addr;
+            }
+            if (ok) {  // (a watched disc file's start read: dvdWatch)
+                std::lock_guard g2(s_discLock);
+                for (Watched& w : s_watched)
+                    if (w.offset == r.offset) w.loadedAt = r.addr;
+            }
         }
         complete(r, ok ? s32(r.length) : -1);
     }
@@ -474,6 +517,137 @@ bool dvdReadFile(const std::string& path, std::vector<u8>& out) {
         }
     }
     return false;
+}
+
+namespace {
+// The FST entry (in guest memory) of a disc file, by its path (any case): its index, or 0.
+u32 fstEntry(const std::string& path) {
+    const u32 fst = rd32(0x80000038);
+    if (!fst) return 0;
+    const u32 n = rd32(fst + 8), strtab = fst + n * 12;
+    auto lower = [](std::string s) {
+        for (char& c : s) c = char(std::tolower(u8(c)));
+        return s;
+    };
+    const std::string want = lower(path);
+    std::vector<std::pair<u32, std::string>> dirs{{n, ""}};
+    for (u32 i = 1; i < n; i++) {
+        while (dirs.size() > 1 && i >= dirs.back().first) dirs.pop_back();
+        const u32 w0 = rd32(fst + i * 12), w2 = rd32(fst + i * 12 + 8);
+        const std::string name = gstr(strtab + (w0 & 0xFFFFFF));
+        if (w0 >> 24) dirs.push_back({w2, dirs.back().second + name + "/"});
+        else if (lower(dirs.back().second + name) == want) return i;
+    }
+    return 0;
+}
+}  // namespace
+
+// Where in guest memory the game last read a served file's start (0: not read yet), and its size.
+u32 dvdOverlayLoadedAt(const std::string& path, u32* size) {
+    std::lock_guard g(s_discLock);
+    for (const Overlay& o : s_overlays)
+        if (o.path == path) {
+            if (size) *size = u32(o.data.size());
+            return o.loadedAt;
+        }
+    return 0;
+}
+
+// Serves `data` as the disc file at `path` from now on (the game reads a file's place and size from the FST when it
+// opens it: the next open sees the new file). Empty data: the disc's own again. False if the disc has no such file.
+// The game keeps its own copies of some files' places (opened once, early: their DVDFileInfo's start and length, as
+// the FST had them): each copy found in MEM1 - the old place and size side by side - moved with the FST's entry.
+void moveCopies(u32 oldAt, u32 oldSize, u32 newAt, u32 newSize, const std::string& path) {
+    int n = 0;
+    for (u32 a = 0x80003100; a + 8 <= 0x80000000 + kMem1Size; a += 4)
+        if (rd32(a) == oldAt && rd32(a + 4) == oldSize) wr32(a, newAt), wr32(a + 4, newSize), n++;
+    if (n) log("[dvd] %s: %d copies of its place moved too\n", path.c_str(), n);
+}
+
+bool dvdOverlay(const std::string& path, std::vector<u8> data) {
+    const u32 i = fstEntry(path);
+    if (!i) return false;
+    const u32 fst = rd32(0x80000038);
+    std::lock_guard g(s_discLock);
+    const u32 oldAt = rd32(fst + i * 12 + 4), oldSize = rd32(fst + i * 12 + 8);
+    if (data.empty()) {  // (the disc's entry, from the FST as read)
+        if (size_t(i) * 12 + 12 <= s_fstCopy.size()) std::memcpy(hostp(fst + i * 12 + 4), s_fstCopy.data() + i * 12 + 4, 8);
+        if (oldAt != rd32(fst + i * 12 + 4)) moveCopies(oldAt, oldSize, rd32(fst + i * 12 + 4), rd32(fst + i * 12 + 8), path);
+        return true;
+    }
+    const u32 at = s_overlayNext;
+    s_overlayNext += u32((data.size() + 0x7FFF) & ~size_t(0x7FFF));
+    wr32(fst + i * 12 + 4, at);
+    wr32(fst + i * 12 + 8, u32(data.size()));
+    moveCopies(oldAt, oldSize, at, u32(data.size()), path);
+    log("[dvd] %s: %zu bytes served in place of the disc's\n", path.c_str(), data.size());
+    {
+        std::string low = path;
+        for (char& ch : low) ch = char(std::tolower(u8(ch)));
+        if (low == "grcity1.dat") g_customCity = true;  // (a custom map in the city's place: src/runtime/maps.cpp)
+    }
+    s_overlays.push_back({at, std::move(data), path});
+    return true;
+}
+
+// A folder's files served in place of the disc's at the same paths (a City Trial map: GrCity1.dat; audio/jp/city.hps in
+// its audio/jp folder); the paths served added to `served`. Its other files (the map's description, pictures) are not.
+void dvdServeDir(const std::string& dir, std::vector<std::string>& served, const std::vector<std::string>& skip) {
+    std::error_code ec;
+    const auto root = std::filesystem::u8path(dir);
+    for (const auto& e : std::filesystem::recursive_directory_iterator(root, ec)) {
+        if (!e.is_regular_file()) continue;
+        const std::u8string rel = e.path().lexically_relative(root).generic_u8string();
+        const std::string name(rel.begin(), rel.end());
+        if (fstEntry(name) == 0 || std::find(skip.begin(), skip.end(), name) != skip.end()) continue;
+        std::FILE* f = _wfopen(e.path().c_str(), L"rb");
+        if (!f) continue;
+        std::vector<u8> data(size_t(e.file_size(ec)));
+        const size_t got = std::fread(data.data(), 1, data.size(), f);
+        std::fclose(f);
+        if (got == data.size() && dvdOverlay(name, std::move(data))) served.push_back(name);
+    }
+}
+
+// The disc's own files at those paths again (between matches: nothing of theirs is being read), their data let go.
+void dvdUnserve(const std::vector<std::string>& paths) {
+    for (const std::string& path : paths) {
+        dvdOverlay(path, {});
+        std::lock_guard g(s_discLock);
+        std::erase_if(s_overlays, [&](const Overlay& o) { return o.path == path; });
+        std::string low = path;
+        for (char& ch : low) ch = char(std::tolower(u8(ch)));
+        if (low == "grcity1.dat") g_customCity = false;
+    }
+    std::lock_guard g(s_discLock);
+    if (s_overlays.empty()) s_overlayNext = kOverlayBase;
+}
+
+u32 dvdEntryNum(const std::string& path) { return fstEntry(path); }
+
+// A disc file as the disc has it (whatever is served in its place).
+std::vector<u8> dvdDiscFile(const std::string& path) {
+    const u32 i = fstEntry(path);
+    if (!i || size_t(i) * 12 + 12 > s_fstCopy.size()) return {};
+    auto be = [&](size_t o) { return u32(s_fstCopy[o]) << 24 | s_fstCopy[o + 1] << 16 | s_fstCopy[o + 2] << 8 | s_fstCopy[o + 3]; };
+    std::vector<u8> data(be(i * 12 + 8));
+    if (!readRaw(be(i * 12 + 4), data.data(), u32(data.size()))) return {};
+    return data;
+}
+
+// Where the game reads a disc file to, from now on (dvdLoadedAt): its start's reads are watched.
+void dvdWatch(const std::string& path) {
+    const u32 i = fstEntry(path);
+    if (!i || size_t(i) * 12 + 12 > s_fstCopy.size()) return;
+    const size_t o = i * 12 + 4;
+    std::lock_guard g(s_discLock);
+    s_watched.push_back({path, u64(u32(s_fstCopy[o]) << 24 | s_fstCopy[o + 1] << 16 | s_fstCopy[o + 2] << 8 | s_fstCopy[o + 3])});
+}
+u32 dvdLoadedAt(const std::string& path) {
+    std::lock_guard g(s_discLock);
+    for (const Watched& w : s_watched)
+        if (w.path == path) return w.loadedAt;
+    return 0;
 }
 
 void dvdOpenDisc(const std::string& path) {

@@ -98,6 +98,8 @@ u32 s_exceptLo[4] = {}, s_exceptHi[4] = {};  // (up to 4 ranges, comma-separated
 thread_local bool t_rearm = false;   // this thread is single-stepping past a write to the pages
 thread_local u32 t_written = 0;      // ... to this guest address in the watched range (0: none)
 thread_local u64 t_rip = 0;          // ... by the host instruction there
+thread_local void* t_stack[24];      // ... and the host stack then (SA2_WATCH_STACK)
+thread_local int t_frames = 0;
 // The guest function a host address is in: its recompiled function's name f_XXXXXXXX (0: not one).
 u32 guestFnAt(u64 rip, char* name, size_t n) {
     static const bool s_sym = [] {
@@ -151,7 +153,23 @@ LONG WINAPI onWatch(EXCEPTION_POINTERS* ep) {
             static const bool s_guestOnly = std::getenv("SA2_WATCH_GUESTONLY") != nullptr;  // (not host code's writes: memset's)
             bool owner = s_guestOnly && !fn;
             for (int i = 0; i < 4; i++) owner = owner || (fn >= s_exceptLo[i] && fn < s_exceptHi[i]);
-            if (!owner && (!s_watchNan || nan) && s_watchHits++ < s_watchMax) reportWatch(g, v, writer);
+            if (!owner && (!s_watchNan || nan) && s_watchHits++ < s_watchMax) {
+                reportWatch(g, v, writer);
+                if (std::getenv("SA2_WATCH_STACK")) {
+                    std::fprintf(stdout, "[watch] host stack:");
+                    for (int i = 0; i < t_frames; i++) {
+                        HMODULE mod = nullptr;
+                        char path[MAX_PATH] = "?";
+                        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           static_cast<LPCSTR>(t_stack[i]), &mod);
+                        if (mod) GetModuleFileNameA(mod, path, MAX_PATH);
+                        const char* base = std::strrchr(path, '\\');
+                        std::fprintf(stdout, " %s+%llX", base ? base + 1 : path,
+                                     (unsigned long long)(reinterpret_cast<uintptr_t>(t_stack[i]) - reinterpret_cast<uintptr_t>(mod)));
+                    }
+                    std::fprintf(stdout, "\n");
+                }
+            }
         }
         protectWatch(PAGE_READONLY);
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -162,6 +180,7 @@ LONG WINAPI onWatch(EXCEPTION_POINTERS* ep) {
     const u32 guest = 0x80000000u | u32(addr - reinterpret_cast<uintptr_t>(g_mem));
     t_written = guest - s_watchGuest < s_watchLen ? guest : 0;
     t_rip = ep->ContextRecord->Rip;
+    t_frames = RtlCaptureStackBackTrace(0, 24, t_stack, nullptr);
     // Let this one write through: unprotect, single-step it, protect again.
     protectWatch(PAGE_READWRITE);
     ep->ContextRecord->EFlags |= 0x100;

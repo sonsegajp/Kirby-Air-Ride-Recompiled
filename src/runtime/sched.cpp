@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -466,6 +467,7 @@ void timerMain() {
         const AlarmEntry e = it->second;
         const u64 when = it->first;
         g_alarms.erase(it);
+        if (!e.period && e.alarm == 0x80550D28 && std::getenv("SA2_ALARM_LOG")) log("[sched] alarm %08X fired once (no period)\n", e.alarm);
         if (e.period) g_alarms.emplace(when + e.period, e);
         lk.unlock();
         postIrq([e](Ctx& c) {
@@ -516,9 +518,32 @@ void debugDump() {
     std::unique_lock lk(g_m);
     log("[sched] running %08X, %zu interrupts queued, pending flag %u, scheduler-disable %d\n",
         g_running ? g_running->guest : 0u, g_irqq.size(), g_irqPending, g_schedDisable);
-    for (auto& [g, t] : g_threads)
+    for (auto& [g, t] : g_threads) {
         log("  thread %08X state %u suspend %d prio %d msr.EE %u started %d cancelled %d\n", g, stateOf(g), suspendOf(g),
             prioOf(t), (t->ctx->msr >> 15) & 1, t->started, t->cancelled);
+        if (!t->started || t->cancelled) continue;
+        // (where it is in the game: its lr, then each frame's saved return address up the back chain)
+        char b[400];
+        int k = std::snprintf(b, sizeof b, "    lr %08X, calls:", t->ctx->lr);
+        u32 sp = t->ctx->r[1];
+        for (int i = 0; i < 14 && (sp & 0xFE000000u) == 0x80000000u && k < int(sizeof b) - 12; i++) {
+            sp = rd32(sp);
+            if ((sp & 0xFE000000u) != 0x80000000u) break;
+            k += std::snprintf(b + k, sizeof b - size_t(k), " %08X", rd32(sp + 4));
+        }
+        log("%s\n", b);
+    }
+    lk.unlock();
+    // the alarms waiting (a game waiting for a frame's message waits for its periodic alarm)
+    std::unique_lock la(g_am);
+    const u64 now = timebase();
+    log("[sched] %zu alarms set:\n", g_alarms.size());
+    for (const auto& [when, e] : g_alarms) {
+        const auto gen = g_alarmGen.find(e.alarm);
+        log("  alarm %08X handler %08X in %.1f ms, period %.2f ms, generation %llu (now %lld)\n", e.alarm, e.handler,
+            (double(s64(when - now)) * 1000.0) / double(kTimebaseHz), double(e.period) * 1000.0 / double(kTimebaseHz),
+            (unsigned long long)e.gen, gen == g_alarmGen.end() ? -1ll : (long long)gen->second);
+    }
 }
 }  // namespace rt::sched
 

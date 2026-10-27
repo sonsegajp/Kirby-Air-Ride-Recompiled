@@ -92,6 +92,8 @@ HLE(SetEffectivePriority) {}
 
 // ---- alarms (OSTime arguments arrive in odd/even register pairs) ----
 HLE(OSSetAlarm) {  // (alarm r3, tick r5:r6, handler r7)
+    static const bool s_log = std::getenv("SA2_ALARM_LOG") != nullptr;
+    if (s_log && c.r[3] == 0x80550D28) log("[os] OSSetAlarm(%08X) handler %08X lr %08X\n", c.r[3], c.r[7], c.lr);
     sched::setAlarm(c.r[3], timebase() + arg64(c, 5), 0, c.r[7]);
 }
 HLE(OSSetPeriodicAlarm) {  // (alarm r3, start r5:r6, period r7:r8, handler r9)
@@ -99,9 +101,21 @@ HLE(OSSetPeriodicAlarm) {  // (alarm r3, start r5:r6, period r7:r8, handler r9)
     u64 first = start;
     const u64 now = timebase();
     if (period && first <= now) first += ((now - first) / period + 1) * period;
+    static const bool s_log = std::getenv("SA2_ALARM_LOG") != nullptr;
+    if (s_log)
+        log("[os] OSSetPeriodicAlarm(%08X) handler %08X lr %08X: start %llX period %llX, first in %lld ticks (r2 %08X r13 %08X sp %08X fpscr %08X)\n",
+            c.r[3], c.r[9], c.lr, (unsigned long long)start, (unsigned long long)period, (long long)(first - now), c.r[2], c.r[13], c.r[1],
+            c.fpscr);
+    if (s_log)
+        log("[os]   bus %u, sdata2 -7CC0 %08X%08X, -7CC8 %08X, frame request %08X%08X, +8 %08X%08X\n", rd32(0x800000F8), rd32(c.r[2] - 0x7CC0),
+            rd32(c.r[2] - 0x7CBC), rd32(c.r[2] - 0x7CC8), rd32(0x80550CC8), rd32(0x80550CCC), rd32(0x80550CB0), rd32(0x80550CB4));
     sched::setAlarm(c.r[3], first, period, c.r[9]);
 }
-HLE(OSCancelAlarm) { sched::cancelAlarm(c.r[3]); }
+HLE(OSCancelAlarm) {
+    static const bool s_log = std::getenv("SA2_ALARM_LOG") != nullptr;
+    if (s_log) log("[os] OSCancelAlarm(%08X) lr %08X\n", c.r[3], c.lr);
+    sched::cancelAlarm(c.r[3]);
+}
 
 // ---- SRAM (normally read over EXI from the RTC chip): a valid, English, stereo setup ----
 // It is placed in the SDK's own SRAM control block (Scb: OSSram, then OSSramEx), because some SDK
