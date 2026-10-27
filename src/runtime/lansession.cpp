@@ -56,6 +56,7 @@
 
 #include "runtime/interp.h"
 #include "runtime/lan.h"
+#include "runtime/maps.h"
 #include "runtime/morepl.h"
 #include "runtime/runtime.h"
 
@@ -135,7 +136,20 @@ void Settings::set(Setting s, int v) {
     if (s < 0 || s >= kSettingCount) return;
     value[s] = std::clamp(v, kInfo[s].min, kInfo[s].max);
 }
-bool Settings::operator==(const Settings& o) const { return game == o.game && std::memcmp(value, o.value, sizeof value) == 0; }
+bool Settings::operator==(const Settings& o) const {
+    return game == o.game && std::memcmp(value, o.value, sizeof value) == 0 && map == o.map;
+}
+
+namespace {
+std::string jsonString(const std::string& s) {  // (quotes and backslashes escaped; control characters left out)
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"' || c == '\\') out += '\\';
+        if (static_cast<unsigned char>(c) >= 0x20) out += c;
+    }
+    return out + "\"";
+}
+}  // namespace
 
 std::string toJson(const Settings& s) {
     std::string j = std::string("{\"game\":\"") + (s.game == Game::AirRide ? "airride" : "citytrial") + "\"";
@@ -145,6 +159,9 @@ std::string toJson(const Settings& s) {
         if (in.choiceIds) j += "\"" + std::string(in.choiceIds[s.value[i] - in.min]) + "\"";
         else j += std::to_string(s.value[i]);
     }
+    if (!s.map.folder.empty())
+        j += ",\"map\":{\"folder\":" + jsonString(s.map.folder) + ",\"title\":" + jsonString(s.map.title) + ",\"hash\":" + jsonString(s.map.hash) +
+             ",\"size\":" + std::to_string(s.map.size) + "}";
     return j + "}";
 }
 
@@ -195,6 +212,37 @@ bool fromJson(std::string_view j, Settings& out, std::string* error) {
             }
             nv = std::atoll(std::string(j.substr(b, p - b)).c_str());
             isNum = true;
+        } else if (key == "map" && p < j.size() && j[p] == '{') {  // the map: its strings and its size
+            for (p++;;) {
+                ws();
+                if (p < j.size() && j[p] == '}') break;
+                std::string k, v;
+                if (!str(k)) return fail("bad map");
+                ws();
+                if (p >= j.size() || j[p] != ':') return fail("expected ':'");
+                p++;
+                ws();
+                if (p < j.size() && j[p] == '"') {
+                    if (!str(v)) return fail("bad string");
+                } else {
+                    while (p < j.size() && j[p] != ',' && j[p] != '}' && j[p] != '{' && j[p] != '[') v += j[p++];
+                }
+                if (v.size() > 256) return fail("bad map");
+                if (k == "folder") s.map.folder = v;
+                else if (k == "title") s.map.title = v;
+                else if (k == "hash") s.map.hash = v;
+                else if (k == "size") s.map.size = uint64_t(std::max(0ll, std::atoll(v.c_str())));
+                ws();
+                if (p < j.size() && j[p] == ',') {
+                    p++;
+                    continue;
+                }
+                if (p < j.size() && j[p] == '}') break;
+                return fail("expected ',' or '}'");
+            }
+            p++;
+            if (s.map.folder.empty()) s.map = Map{};
+            for (char& c : s.map.hash) c = char(std::tolower(static_cast<unsigned char>(c)));
         } else {  // true / false / null / nested: skipped
             int depth = 0;
             while (p < j.size()) {
@@ -248,6 +296,8 @@ uint32_t hash(const Settings& s) {
     };
     mix(uint32_t(s.game));
     for (int i = 0; i < kSettingCount; i++) mix(uint32_t(s.value[i]));
+    if (!s.map.folder.empty())  // (the map by its content: the same map whatever its folder's name on each console)
+        for (char c : s.map.hash) mix(uint32_t(static_cast<unsigned char>(c)));
     return h;
 }
 
@@ -356,7 +406,10 @@ void setPhase(Phase p, const char* why = nullptr) {
     log("[lansession] %s -> %s%s%s\n", phaseName(s_phase), phaseName(p), why ? ": " : "", why ? why : "");
     s_phase = p;
     s_phaseSteps = 0;
-    if (p == Phase::Idle || p == Phase::Failed) lan::setSession(0, 0, 0);  // (the game's own LAN menus again)
+    if (p == Phase::Idle || p == Phase::Failed) {
+        lan::setSession(0, 0, 0);  // (the game's own LAN menus again)
+        maps::endSession();        // (the player's own City Trial map again)
+    }
     std::lock_guard g(s_lock);
     s_status.phase = p;
     s_status.cover = p == Phase::Connecting || p == Phase::Parked || p == Phase::Leaving || p == Phase::Waiting;
@@ -540,9 +593,19 @@ void lanViews(Ctx& c, u32 entry) {
     }
 }
 
+void disconnectFromLanMenu(Ctx& c);
+
 // From the LAN menu's screen 6 (in step on every console): the match starts.
 void startMatch(Ctx& c) {
     const Settings& s = s_cur.settings;
+    // City Trial's stage: the session's on every console - the city too (this console's own choice may be another
+    // map), served before the scene ends (the stage loads after it). A map this console does not have: no match here
+    // rather than another stage than the others' (the server waits for every player's map: this is the last guard).
+    if (s.game == Game::CityTrial && !maps::selectForSession(s.map.folder, s.map.hash)) {
+        disconnectFromLanMenu(c);
+        fail("This PC does not have the server's map (" + s.map.title + ").");
+        return;
+    }
     if (!rd8(kLm + 5)) {  // as the first A on this screen: the seed every console agreed, the unlocks merged
         guestCall(c, kAgreeSeed);
         guestCall(c, kMergeUnlocks);

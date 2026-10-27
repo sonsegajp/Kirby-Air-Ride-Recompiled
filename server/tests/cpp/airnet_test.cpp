@@ -1,13 +1,15 @@
 // airnet_test: the game's online client (src/runtime/airnet.cpp) against a real master server.
 //
-//   airnet_test --master 127.0.0.1:27600 [--prefix cpp] [--udp-blocked 1]
+//   airnet_test --master 127.0.0.1:27600 [--prefix cpp] [--udp-blocked 1] [--maps 1|2]
 //
 // Two clients register, one hosts, the other finds the server and joins, both enter a match group,
 // and LAN frames go through the relay both ways - over UDP, then with one and both clients on the TCP
 // relay. With --udp-blocked 1 (a server whose UDP never answers) the clients must fall back to TCP by
-// themselves. Also checks the crypto against known vectors.
+// themselves. Also checks the crypto against known vectors. With --maps 1 (2): the host's City Trial map
+// downloaded by the consoles without it (peer to peer, and through the relay over TCP - UDP), instead.
 // Run by server/tests/test_cpp_client.py (which starts the server); exit code 0 = pass.
 #include "runtime/airnet.h"
+#include "runtime/mapfiles.h"
 #include "runtime/settings.h"
 
 #include <algorithm>
@@ -16,6 +18,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <thread>
@@ -287,16 +291,136 @@ static int natTest([[maybe_unused]] const std::string& master, const std::string
     return 0;
 }
 
+// ---- City Trial maps: the host's map downloaded by the consoles without it ----
+static void writeFile(const std::filesystem::path& p, size_t size, uint32_t seed) {
+    std::filesystem::create_directories(p.parent_path());
+    std::vector<char> b(size);
+    for (size_t i = 0; i < size; i++) seed = seed * 1664525u + 1013904223u, b[i] = char(seed >> 24);
+    std::ofstream(p, std::ios::binary).write(b.data(), std::streamsize(b.size()));
+}
+
+// A hosts with a map; B (a player: peer to peer on this PC) has none, C (waiting: through the relay, over TCP or UDP) an
+// older map of the same name. Both get A's, checked and put in place; the master hears each has it, and the match
+// starts. Then a map A does not have: B's download fails, and says so.
+static int mapTest(const std::string& prefix, bool tcp) {
+    namespace fs = std::filesystem;
+    const std::string password = "correct horse";
+    const std::string names[3] = {prefix + "_host", prefix + "_bee", prefix + "_sea"};
+    const fs::path root = fs::absolute("maptest");
+    fs::remove_all(root);
+    const fs::path dirs[3] = {root / "a", root / "b", root / "c"};
+    const fs::path map = dirs[0] / "Test Map!";  // (a name a download keeps as its letters and digits: TestMap)
+    writeFile(map / "GrCity1.dat", 700 * 1000 + 17, 1);
+    writeFile(map / "GrCity1Model.dat", 1100 * 1000, 2);
+    writeFile(map / "audio" / "jp" / "city.hps", 300 * 1000 + 5, 3);
+    writeFile(map / "minimap_0.bin", 1200, 4);  // (exactly a chunk's worth)
+    std::ofstream(map / "mod.json") << "{\"name\": \"Test Map\"}";
+    writeFile(dirs[2] / "TestMap" / "GrCity1.dat", 5000, 9);  // C's older map of that name
+    fs::create_directories(dirs[1]);
+    std::string hash;
+    uint64_t size = 0;
+    CHECK(rt::mapfiles::folderHash(rt::mapfiles::dirOf(dirs[0].string(), "Test Map!"), hash, size));
+    CHECK(hash.size() == 64 && size == 700 * 1000 + 17 + 1100 * 1000 + 300 * 1000 + 5 + 1200 + 20);
+    {  // (packed and unpacked here first: what goes over the network)
+        std::vector<uint8_t> packed;
+        uint32_t manifest = 0;
+        std::string packedHash, err, folder;
+        CHECK(rt::mapfiles::pack(rt::mapfiles::dirOf(dirs[0].string(), "Test Map!"), packed, manifest, packedHash) && packedHash == hash);
+        packed[manifest + 5] ^= 1;  // a byte changed on the way: refused
+        CHECK(!rt::mapfiles::install((root / "x").string(), "Test Map!", hash, packed, manifest, err, &folder) && !err.empty());
+        CHECK(!fs::exists(root / "x" / "TestMap") && !fs::exists(root / "x" / ".dl-TestMap"));
+    }
+    Client a, b, c;
+    Client* cs[3] = {&a, &b, &c};
+    for (int i = 0; i < 3; i++) detail::setMapsFolder(*cs[i], dirs[i].string());
+    registerAll({&a, &b, &c}, {names[0], names[1], names[2]}, password);
+    c.forceRelayTcp(tcp);
+    HostOptions opt;
+    opt.name = "Map test";
+    opt.maxPlayers = 2;  // (C waits: not on the roster, it gets the map through the relay all the same)
+    opt.autoStart = false;
+    opt.mode = Mode::CityTrial;
+    char settings[512];
+    std::snprintf(settings, sizeof settings, R"({"game":"citytrial","map":{"folder":"Test Map!","title":"Test Map","hash":"%s","size":%llu}})",
+                  hash.c_str(), static_cast<unsigned long long>(size));
+    opt.settingsJson = settings;
+    a.host(opt);
+    waitFor(a, "hosting", [](const Snapshot& s) { return s.inLobby; });
+    const uint32_t lobby = a.snapshot().lobby.id;
+    b.join(lobby);
+    waitFor(b, "B a player", [](const Snapshot& s) { return s.player; });
+    c.join(lobby);
+    waitFor(a, "A has its own map", [](const Snapshot& s) { return s.mapState == MapState::Ready && s.mapTitle == "Test Map"; });
+    waitFor(b, "B direct to A", [&](const Snapshot& s) {
+        const Member* m = memberNamed(s, names[0]);
+        return m && m->path == Path::DirectLan;
+    });
+    const auto t0 = Clock::now();
+    waitFor(b, "B has the map", [&](const Snapshot& s) { return s.mapState == MapState::Ready; }, 60000);
+    const auto tb = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+    float seen = 0;
+    waitFor(c, "C has the map", [&](const Snapshot& s) {  // (through the relay, paced: its progress seen on the way)
+        if (s.mapState == MapState::Downloading && s.mapProgress > 0 && s.mapProgress < 1) seen = s.mapProgress;
+        return s.mapState == MapState::Ready;
+    }, 90000);
+    const auto tc = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count();
+    std::printf("map download: %llu bytes, B peer to peer %lld ms, C through the relay (%s) %lld ms (C seen at %.0f%%)\n",
+                static_cast<unsigned long long>(size), static_cast<long long>(tb), tcp ? "TCP" : "UDP", static_cast<long long>(tc), seen * 100.f);
+    CHECK(seen > 0);
+    CHECK(c.snapshot().relayTcp == tcp);
+    for (int i = 1; i < 3; i++) {
+        std::string h;
+        uint64_t n = 0;
+        CHECK(rt::mapfiles::folderHash(rt::mapfiles::dirOf(dirs[i].string(), "TestMap"), h, n) && h == hash);  // (C's older one replaced)
+        CHECK(rt::mapfiles::find(dirs[i].string(), "Test Map!", hash) == "TestMap");
+        for (const auto& e : fs::directory_iterator(dirs[i])) CHECK(e.path().filename() == "TestMap");  // (nothing left over)
+    }
+    // the master knows: every member's map is the settings' - and the match starts
+    waitFor(a, "every member has the map", [&](const Snapshot& s) {
+        return s.lobby.members.size() == 3 &&
+               std::all_of(s.lobby.members.begin(), s.lobby.members.end(), [&](const Member& m) { return m.mapOk == hash; });
+    });
+    a.startMatch(true);
+    waitFor(b, "match start", [](const Snapshot& s) { return s.matchSerial == 1; });
+    CHECK(b.snapshot().match.settingsJson.find(hash) != std::string::npos);
+    a.endMatch("{}");
+    waitFor(a, "results", [](const Snapshot& s) { return s.lobby.session == SessionState::Results; });
+    a.continueSession();
+    waitFor(a, "lobby again", [](const Snapshot& s) { return s.lobby.session == SessionState::Lobby; });
+    // a map the host does not have: B asks, A says so, B shows why (and the match waits)
+    std::snprintf(settings, sizeof settings, R"({"game":"citytrial","map":{"folder":"Nowhere","title":"Nowhere","hash":"%s","size":10}})",
+                  std::string(64, 'e').c_str());
+    a.setGameSettings(settings);
+    waitFor(b, "B cannot get it", [](const Snapshot& s) { return s.mapState == MapState::Failed && !s.mapError.empty() && s.mapTitle == "Nowhere"; },
+            20000);
+    std::printf("a map nobody has: \"%s\"\n", b.snapshot().mapError.c_str());
+    a.startMatch(true);
+    waitFor(a, "no match without it", [](const Snapshot& s) { return s.error.find("map") != std::string::npos; });
+    // the city again: nothing to get
+    a.setGameSettings(R"({"game":"citytrial"})");
+    waitFor(b, "no map", [](const Snapshot& s) { return s.mapState == MapState::None; });
+    for (Client* x : cs) x->disconnect();
+    fs::remove_all(root);
+    if (g_failures) {
+        std::printf("AIRNET TEST FAILED (%d)\n", g_failures);
+        return 1;
+    }
+    std::printf("AIRNET TEST PASSED\n");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::string master = "127.0.0.1:27600";
     std::string prefix = "cpp";
     std::string stun;  // (none: never a real STUN server from tests)
     std::string nat[3];
     bool udpBlocked = false;
+    int maps = 0;  // (1: the map test, C on the TCP relay; 2: on UDP)
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "--master")) master = argv[i + 1];
         if (!std::strcmp(argv[i], "--prefix")) prefix = argv[i + 1];
         if (!std::strcmp(argv[i], "--udp-blocked")) udpBlocked = std::atoi(argv[i + 1]) != 0;
+        if (!std::strcmp(argv[i], "--maps")) maps = std::atoi(argv[i + 1]);
         if (!std::strcmp(argv[i], "--stun")) stun = argv[i + 1];
         for (int k = 0; k < 3; k++) {
             const std::string flag = std::string("--nat-") + char('a' + k);
@@ -311,6 +435,7 @@ int main(int argc, char** argv) {
     rt::settings::onlineMaster.set(master);  // where calls connect to by themselves
     rt::settings::onlineStun.set(stun);
     if (!nat[0].empty()) return natTest(master, prefix, nat);
+    if (maps) return mapTest(prefix, maps == 1);
 
     const uint8_t macA[6] = {0x02, 0x4B, 0x41, 0x52, 0x00, 0x0A};
     const uint8_t macB[6] = {0x02, 0x4B, 0x41, 0x52, 0x00, 0x0B};

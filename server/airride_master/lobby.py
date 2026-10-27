@@ -38,7 +38,7 @@ class Member:
     __slots__ = ("lobby", "user_id", "name", "key", "session", "joined", "away_since",
                  "relay_id", "relay_secret", "p2p_key", "mac", "candidates", "sent_peers",
                  "addr", "stream", "last_relay", "lan",
-                 "tokens", "tokens_time", "frames_in", "frames_out", "dropped")
+                 "tokens", "tokens_time", "frames_in", "frames_out", "dropped", "map_ok")
 
     def __init__(self, lobby, user_id, name, session, relay_id):
         self.lobby = lobby
@@ -63,6 +63,7 @@ class Member:
         self.frames_in = 0
         self.frames_out = 0
         self.dropped = 0
+        self.map_ok = ""                # the City Trial map its console has (its hash), from map_status
 
     def relay_info(self, udp_port):
         return {"id": self.relay_id, "secret": self.relay_secret.hex(), "port": udp_port,
@@ -211,6 +212,18 @@ class Lobby:
                       "start_at": start_at}
         return self.match
 
+    def map_hash(self):
+        """The hash of the City Trial map the settings name ("": none, the city)."""
+        m = self.settings.get("map") if isinstance(self.settings, dict) else None
+        if not isinstance(m, dict) or not m.get("folder"):
+            return ""
+        return str(m.get("hash", "")).lower()
+
+    def map_ready(self):
+        """Every player of the next match has the settings' map (or there is none)."""
+        h = self.map_hash()
+        return not h or all(m.map_ok == h for m in self.roster())
+
     def end_match(self, now, seconds):
         self.state = RESULTS
         self.deadline = now + seconds
@@ -250,6 +263,7 @@ class Lobby:
                 "relay": m.addr is not None or m.stream is not None,
                 "relay_tcp": m.stream is not None,
                 "away": s is None,
+                "map_ok": m.map_ok,
             })
         match = None
         if self.match is not None:

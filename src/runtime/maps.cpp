@@ -3,6 +3,7 @@
 // code rather than from the stage files, is left out on such a map.
 #include "runtime/maps.h"
 #include "runtime/interp.h"
+#include "runtime/mapfiles.h"
 #include "runtime/morepl.h"
 #include "runtime/runtime.h"
 #include "runtime/settings.h"
@@ -511,6 +512,7 @@ void scanMods() {
         if (!e.is_directory() || !std::filesystem::exists(e.path() / "GrCity1.dat", ec)) continue;
         const std::u8string folder = e.path().filename().u8string(), full = e.path().u8string();
         const std::string f(folder.begin(), folder.end());
+        if (f.empty() || f[0] == '.') continue;  // (a downloaded map being put in place: src/runtime/mapfiles.cpp)
         found.push_back({f, modTitle(e.path(), f), std::string(full.begin(), full.end())});
     }
     std::sort(found.begin(), found.end(), [](const MapMod& a, const MapMod& b) { return a.title < b.title; });
@@ -580,6 +582,41 @@ void rescan() {
         if (s_mods[k].dir == dir) keep = int(k) + 1;
     if (keep != s_selected || (keep && dir != s_mods[size_t(keep - 1)].dir)) serve(keep);
     else s_selected = keep;
+}
+
+namespace {
+bool s_session = false;  // an online session's map is served, not the player's own choice
+}  // namespace
+
+bool selectForSession(const std::string& folder, const std::string& hash) {
+    rescan();
+    int pick = -1;
+    if (folder.empty()) {
+        pick = std::getenv("SA2_MAP_DIR") ? 1 : 0;  // the city (or SA2_MAP_DIR's: developing a map, every PC of the test has it)
+    } else {
+        const std::string found = mapfiles::find(mapfiles::defaultRoot(), folder, hash);  // (its hash worked out already: airnet's check)
+        for (size_t k = 0; k < s_mods.size() && !found.empty(); k++)
+            if (s_mods[k].folder == found) pick = int(k) + 1;
+    }
+    if (pick < 0) {
+        log("[maps] the session's map %s (%s) is not on this PC\n", folder.c_str(), hash.c_str());
+        return false;
+    }
+    s_session = true;
+    if (pick != s_selected) serve(pick);
+    log("[maps] the session's map: %s\n", name(pick).c_str());
+    return true;
+}
+
+void endSession() {
+    if (!s_session) return;
+    s_session = false;
+    rescan();
+    int own = std::getenv("SA2_MAP_DIR") ? 1 : 0;  // (the player's own: as mapsInit chooses it)
+    for (size_t k = 0; k < s_mods.size() && !own; k++)
+        if (!s_mods[k].folder.empty() && s_mods[k].folder == settings::cityMap.get()) own = int(k) + 1;
+    if (own != s_selected) serve(own);
+    log("[maps] the session is over: %s again\n", name(own).c_str());
 }
 }  // namespace maps
 

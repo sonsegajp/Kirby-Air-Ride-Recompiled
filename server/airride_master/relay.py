@@ -11,6 +11,10 @@ Each server's roster (the consoles of its match) is one LAN. Clients send frames
 they can and through the relay to the rest: FRAME_TO names who still needs a frame, so no console
 gets it twice.
 
+One exception: a City Trial map's frames (EtherType protocol.MAP_ETHERTYPE: a console downloading the
+host's map) go, as FRAME_TO only, between any members of one lobby - those waiting too. They are no
+part of the LAN: its MACs are not learnt from them.
+
 Two transports carry the same messages:
 - UDP (the relay port): one message per datagram. The preferred one.
 - TCP (the control port, for players whose network lets no UDP through): the connection starts
@@ -126,13 +130,8 @@ class Relay(asyncio.DatagramProtocol):
             self.transport.sendto(data, o.addr)
             o.frames_out += 1
 
-    def _frame(self, m, data, targets=None):
-        """A frame from `m` (`data`: a FRAME message); `targets`: the relay ids it is for (FRAME_TO)."""
-        n = len(data) - P.RELAY_HEADER
-        g = m.lan
-        if g is None or n < P.FRAME_MIN or n > P.FRAME_MAX:
-            m.dropped += 1
-            return
+    def _take(self, m, n):
+        """Counts a frame of `n` bytes from `m`: False if it is over its rate (dropped)."""
         now = time.monotonic()
         m.last_relay = now
         # Token bucket: RELAY_RATE frames a second, bursts up to RELAY_BURST.
@@ -144,11 +143,38 @@ class Relay(asyncio.DatagramProtocol):
             m.tokens = tokens
             m.dropped += 1
             self.dropped += 1
-            return
+            return False
         m.tokens = tokens - 1.0
         m.frames_in += 1
         self.frames += 1
         self.bytes += n
+        return True
+
+    def _map_frame(self, m, data, n, targets):
+        """A City Trial map's frame (protocol.MAP_ETHERTYPE): to the members it names (FRAME_TO only), any of the
+        sender's lobby - the roster's or not. The LAN (and its MACs) is not involved."""
+        if targets is None or m.lobby is None or n > P.FRAME_MAX:
+            m.dropped += 1
+            return
+        if not self._take(m, n):
+            return
+        for rid in targets:
+            o = self.members.get(rid)
+            if o is not None and o is not m and o.lobby is m.lobby:
+                self._deliver(o, data)
+
+    def _frame(self, m, data, targets=None):
+        """A frame from `m` (`data`: a FRAME message); `targets`: the relay ids it is for (FRAME_TO)."""
+        n = len(data) - P.RELAY_HEADER
+        if n >= P.FRAME_MIN and data[P.RELAY_HEADER + 12:P.RELAY_HEADER + 14] == P.MAP_ETHERTYPE:
+            self._map_frame(m, data, n, targets)
+            return
+        g = m.lan
+        if g is None or n < P.FRAME_MIN or n > P.FRAME_MAX:
+            m.dropped += 1
+            return
+        if not self._take(m, n):
+            return
         # Learn where the sender's MAC lives (unicast source addresses only).
         if not data[14] & 1:
             src = data[14:20]

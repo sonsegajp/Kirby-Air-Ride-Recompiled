@@ -70,6 +70,14 @@ RELAY_STREAM_QUEUE = 64 * 1024   # bytes queued to a member's stream before fram
 RELAY_STREAM_STALL = 5.0         # ... and seconds it may stay that backed up before it is closed
 RELAY_STREAM_SNDBUF = 64 * 1024  # the kernel's send buffer for a stream (no seconds of frames queued there)
 
+# ---- City Trial maps ------------------------------------------------------------------------------
+# The host's settings may name a map mod ("map": {"folder", "title", "hash", "size"}); a console without it downloads
+# it from the host's console in Ethernet frames of this type (docs/ONLINE.md "Maps"). The relay passes them, as
+# FRAME_TO, between any members of a lobby - not only the roster's: those waiting get the map too. Each member reports
+# the map it has (map_status); a match on a map starts only once every player of it has it.
+MAP_ETHERTYPE = b"\x88\xb6"
+MAP_HASH_HEX = 64           # a map's hash: SHA-256, as hex
+
 # ---- profiles -------------------------------------------------------------------------------------
 # Kirby's colours in Kirby Air Ride.
 COLOURS = ("pink", "yellow", "red", "blue", "green", "purple", "brown", "white")

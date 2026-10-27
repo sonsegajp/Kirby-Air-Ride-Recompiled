@@ -51,6 +51,29 @@ class CppClient(ServerTest):
 
 
 @unittest.skipUnless(find_exe(), "airnet_test not built")
+class CppClientMaps(ServerTest):
+    """A City Trial map downloaded from the host's console: by a player peer to peer, by a member who waits through
+    the relay (over TCP); the files checked and put in place; the match waiting for every player's map."""
+
+    def run_maps(self, mode, prefix):
+        with tempfile.TemporaryDirectory() as cwd:
+            proc = subprocess.run([find_exe(), "--master", "127.0.0.1:%d" % self.srv.tcp_port, "--prefix", prefix, "--maps", mode],
+                                  cwd=cwd, capture_output=True, text=True, timeout=240)
+        out = proc.stdout + proc.stderr
+        if proc.returncode != 0 or "AIRNET TEST PASSED" not in out:
+            self.fail("airnet_test (maps) failed (exit %d):\n%s" % (proc.returncode, out))
+        for line in out.splitlines():
+            if line.startswith("map download") or line.startswith("a map nobody"):
+                print("\n    " + line.strip(), end="")
+
+    def test_map_download_relay_tcp(self):
+        self.run_maps("1", "mapt")
+
+    def test_map_download_relay_udp(self):
+        self.run_maps("2", "mapu")
+
+
+@unittest.skipUnless(find_exe(), "airnet_test not built")
 class CppClientUdpBlocked(ServerTest):
     """No UDP gets through (as on a host whose firewall lets only TCP in): the server tells clients a
     UDP port where nothing answers, and they must move the relay to TCP by themselves."""

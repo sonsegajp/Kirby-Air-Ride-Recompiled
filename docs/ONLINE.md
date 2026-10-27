@@ -75,7 +75,8 @@ cable plugged in once a path works); off the roster it uninstalls it (no cable).
 | `server/airride_master/client.py` | a reference client in Python (tests, debugging) |
 | `server/tests/` | the test suite; `tests/cpp/airnet_test.cpp` drives the C++ client; `tests/natsim.py` simulates NATs and a STUN server |
 | `server/DEPLOY.md`, `server/airride-master.service`, `server/run.sh` | running it on a VPS |
-| `src/runtime/airnet.h`, `airnet.cpp` | the game's client |
+| `src/runtime/airnet.h`, `airnet.cpp` | the game's client (and its map downloads: see Maps) |
+| `src/runtime/mapfiles.h`, `mapfiles.cpp` | City Trial map mods as files: their content hash, packed and unpacked for a download |
 | `src/runtime/settings.*` | `online_master`, `online_server`, `online_user`, `online_token`, `online_token_server`, `online_relay_tcp`, `online_p2p`, `online_stun` |
 
 ## Control protocol (TCP, default port 27600)
@@ -122,11 +123,12 @@ peer) replaced 1 (match groups): clients speaking 1 are told to update.
 | `kick` | `username` | | host |
 | `lobby_set` | any `host` field | `lobby` | host; `password:""` opens it |
 | `settings_set` | `settings` (object) | `settings` | host; not during a match |
-| `session_start` | [`now`] | | host: the countdown (`now`: the match at once); 2+ players |
+| `session_start` | [`now`] | | host: the countdown (`now`: the match at once); 2+ players, each with the settings' map (`map_missing`) |
 | `session_cancel` | | | host: stop the countdown / abandon the match; holds the automatic countdown |
 | `session_continue` | | | host: end the results early |
 | `match_end` | [`results`] (object) | | a player's game says the match is over |
 | `peer_info` | `mac` (12 hex), `candidates` | | where this console can be reached (see Peer to peer) |
+| `map_status` | `map_ok` (64 hex, or `""`) | | the City Trial map this console has (see Maps); the game's client sends it without an `id` |
 | `chat` | `text` | | 200 characters; 5 lines per 10 s |
 
 Every request but `ping`, `register`, `login_begin`, `login` and `resume` needs a login. Requests
@@ -147,9 +149,10 @@ are rate-limited (20 a second, bursts of 60).
 A server's state (`lobby`): `{"id","name","host","max","max_players","locked","mode","region",
 "migrate","auto_start","state":"lobby|countdown|match|results","hold","countdown_ms","results_ms",
 "match":{"id","players":[names]}|null,"results":{name: object},"settings":{…},
-"members":[{"name","colour","machine","host","player","peer","ping","relay","relay_tcp","away"}]}`
+"members":[{"name","colour","machine","host","player","peer","ping","relay","relay_tcp","away","map_ok"}]}`
 (`player`: on the roster; `peer`: their peer id; `relay`: the relay hears from them; `relay_tcp`:
-over TCP; `away`: connection dropped, place kept; `countdown_ms` / `results_ms`: time left).
+over TCP; `away`: connection dropped, place kept; `map_ok`: the hash of the City Trial map their
+console has, from `map_status`; `countdown_ms` / `results_ms`: time left).
 
 `relay`: `{"id":<u32>,"secret":"<16 hex>","port":27601,"key":"<16 hex>"}` - this member's relay
 credentials, and its peer-to-peer key. The relay id is also its *peer id*.
@@ -196,12 +199,73 @@ Packets (the same 8-byte header as the relay: type, version 1, 0, 0, sender's pe
 | `0x10` PING | sender's key (8) + echo (u32) + receiver's peer id (u32) |
 | `0x11` PONG | sender's key (8) + the ping's echo (u32) + receiver's peer id (u32) |
 | `0x12` FRAME | one Ethernet frame |
+| `0x13` MAP | one map frame (see Maps): never handed to the game |
 
 The client's link (`Snapshot::linkUp`, the adapter's cable) is up while it is on the roster and
 either the relay answers or every peer has a direct path.
 
 Not done (yet): IPv6 candidates (IPv4 only), TURN-style relays other than the master, and
 port-prediction tricks for symmetric NATs (those consoles use the relay).
+
+## Maps (City Trial map mods, from the host's console)
+
+The host's game settings may name a City Trial map mod (`mods/maps/<folder>`, src/runtime/maps.h)
+as the stage: the lobby's Stage row (City Trial) offers the city ("Original") and the map mods on the
+host's PC. The settings carry it as
+
+```
+"map": {"folder": "Hyrule Field", "title": "Hyrule Field", "hash": "<64 hex>", "size": <bytes>}
+```
+
+(missing, or `folder` `""`: the city). The master only checks that a named map has a hash. The
+**hash** names the map by its content (src/runtime/mapfiles.h): SHA-256 over every file in its
+folder (its sub-folders too), in the order of their paths (relative, `/` between folders, compared
+byte by byte) - each its path (UTF-8), a 0 byte, its size (u64, big-endian), then its bytes. Each PC
+works it out on a worker and keeps it while the files' sizes and times stay the same.
+
+**Getting it.** Each client looks for the lobby's map among its own map mods (the folder of that
+name, or of its downloaded name, then any with that hash). Without it, it downloads it from the
+host's console: `Snapshot::mapState` Checking, Downloading (`mapProgress`), Ready, or Failed
+(`mapError`; tried again after 15 s). Members waiting for the next match download it too.
+
+The transfer is Ethernet frames of EtherType `0x88B6`, never handed to the game: peer to peer as
+packet type `0x13` where a direct path works (roster members), else through the relay as FRAME_TO
+naming that one console (the relay passes these between any members of a server). After the
+Ethernet header: kind (u8), version (1), 0 (u16), the map's id (the hash's first 8 bytes), then
+
+| Kind | Way | Body |
+|------|-----|------|
+| 1 ASK | to the host | - (sent every second until INFO comes; again after 6 s without data) |
+| 2 INFO | to the downloader | total bytes (u32), manifest bytes (u32), chunk size (u16, 1200) |
+| 3 DATA | to the downloader | chunk number (u32), up to 1200 bytes |
+| 4 ACK | to the host | first chunk missing (u32), n (u16), n bytes: a bit per chunk from that one (lowest bit first) |
+| 5 DONE | to the host | - every chunk came (or the download stopped): no more |
+| 6 GONE | to the downloader | - the host has no such map to send |
+
+What is sent is the map **packed**: a manifest - `karmap 1`, then a line per file: its size, its
+SHA-256 (hex), its path - followed by every file's bytes in the manifest's order (at most 1024 files,
+512 MiB). The host packs it on a worker when first asked and answers the consoles that asked then.
+It sends chunks at most 1024 beyond the first one not acknowledged, paced: 400 a second through the
+relay (every console it sends to, together; 100 while a match is on), 2000 a second to each console
+peer to peer; a chunk not
+acknowledged within 1 s (relay) or 300 ms (direct) goes again. The downloader acknowledges every
+40 ms while chunks come (every 500 ms at least). A new host (the old one left) is asked at once, and
+what came is kept (the same map packs the same). When all has come, a worker checks every file's
+SHA-256, writes them to `mods/maps/.dl-<name>`, checks the whole folder's hash, and renames it to
+`mods/maps/<name>` - `<name>` the folder's letters and digits - replacing a folder of that name only
+if its content differs.
+
+**The match waits for it.** Each client reports the map it has: `map_status` with `map_ok` (the
+hash; `""` when it has none or there is no map). The master shows it per member (`map_ok`), starts
+the automatic countdown only when every roster player's `map_ok` is the settings' map's hash, drops
+a countdown back to the lobby if a player without it comes onto the roster, and refuses
+`session_start` (`map_missing`) until then. A server with no map waits for nothing.
+
+**Playing it.** As each match starts (lansession, on the game's thread, every console in step) the
+session's map is served on every console - the city too, explicitly, since a console's own offline
+choice may be another map - without being kept as the player's choice (it is served again when the
+session ends). A console that does not have it fails the start (the others' sessions then end)
+rather than play another stage.
 
 ## Relay protocol (UDP, default port 27601)
 
@@ -227,7 +291,8 @@ Every datagram: an 8-byte header, then the body.
   to all of them while it is unknown (as a switch does).
 - **FRAME_TO** (client to server): body = n (u8, 1-16) + n relay ids (u32 each) + one frame. The
   frame goes, as a FRAME, to those of them on the sender's roster only (the others got it peer to
-  peer).
+  peer). A map frame (EtherType `0x88B6`, see Maps) instead goes to those of them in the sender's
+  server, on the roster or not (a plain FRAME of that type goes nowhere); no MAC is learnt from it.
 - An address silent for 15 s is forgotten (the next HELLO restores it).
 
 ### The relay over TCP (when UDP does not get through)
@@ -371,6 +436,8 @@ if (s.errorSerial != shownError) { /* toast s.error */ }
 - Chat: `chat(text)` -> `Snapshot::chat` (last 100 lines).
 - Network: `Snapshot::linkUp`, `relayTcp`, `p2p`, `publicAddress` (STUN answered), `pingMs`, frame
   counters; `Client::port()` is the `rt::lan::Port`; `forceRelayTcp(bool)`, `enableP2p(bool)`.
+- The lobby's City Trial map (see Maps): `Snapshot::mapState`, `mapProgress`, `mapTitle`,
+  `mapError`; `Member::mapOk`.
 - Old match-group calls (`joinGroup`, `leaveGroup`, `moveToGroup`, `arrangeGroups`, `autoFill`,
   `setPlaying`) are kept as no-ops so the menu builds; `Member::group`, `Snapshot::myGroup` and
   `Lobby::groups` show the roster as group 1. They will go once the menu uses the session.
@@ -406,7 +473,11 @@ the relay between fake UDP consoles (one LAN per server, waiting members cut off
 flooding, FRAME_TO, roster changes, spoofing, size and rate limits, rebinding, latency), and the
 relay over TCP (`test_relay_tcp.py`: a TCP-only LAN, TCP and UDP members together, FRAME_TO,
 switching transports, rejected streams, one member per stream, leaving closes the stream, a member
-that stops reading gets frames dropped while the others are served, latency).
+that stops reading gets frames dropped while the others are served, latency), and City Trial maps
+(`test_maps.py`: a named map needs a hash, `map_status` validated and shown per member, the
+countdown and `session_start` waiting for every player's map - not those waiting - a countdown
+stopped by a player without it, no wait without a map; map frames relayed between the host and a
+waiting member, only as FRAME_TO, only within the server, no MACs learnt, within the rate limit).
 
 The C++ client is tested against the real server by `tests/test_cpp_client.py`, which runs
 `airnet_test` (CMake target, not built by default):
@@ -431,3 +502,9 @@ cmake --build <build dir> --target airnet_test
   nothing (as on the VPS): the two behind cone NATs find a direct path by hole punching; the one
   behind the symmetric NAT reaches both through the relay (TCP); every frame arrives exactly once;
   a three-console match start.
+- `CppClientMaps` (`airnet_test --maps 1`, and `2`): a map packed and a damaged copy refused; the
+  host's map (about 2 MB, sub-folders, an odd folder name) downloaded by a player peer to peer and by
+  a member waiting for the next match through the relay (TCP, then UDP) - one of them replacing an
+  older map of the same name - checked and put in place with nothing left over; every member's
+  `map_ok` at the master, then the match start; a map the host does not have (GONE: the download
+  fails and says so, the match does not start); the city again.

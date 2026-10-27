@@ -61,9 +61,18 @@ struct SettingInfo {
 const SettingInfo& info(Setting s);
 inline constexpr int settingCount() { return kSettingCount; }
 
+// City Trial's stage: a map mod played in the city's place (src/runtime/maps.h), the same on every console - named by
+// its folder (as the host has it) and found by its content's hash (src/runtime/mapfiles.h). Folder "": the city.
+struct Map {
+    std::string folder, title, hash;
+    uint64_t size = 0;  // its files' bytes
+    bool operator==(const Map&) const = default;
+};
+
 struct Settings {
     Game game = Game::CityTrial;
     int value[kSettingCount];
+    Map map;                                // (City Trial)
     Settings();                             // every setting at its default
     int get(Setting s) const { return value[s]; }
     void set(Setting s, int v);             // clamped to the setting's range
@@ -71,6 +80,7 @@ struct Settings {
 };
 // JSON: {"game":"citytrial","ct.minutes":5,"ct.stadium":"shuffle",...} - every key is optional (missing:
 // default); choices by id (or index); unknown keys are ignored. The master server keeps it as an opaque object.
+// The map: "map":{"folder":...,"title":...,"hash":"<SHA-256, hex>","size":<bytes>} (missing, or folder "": the city).
 std::string toJson(const Settings& s);
 bool fromJson(std::string_view json, Settings& out, std::string* error = nullptr);
 uint32_t hash(const Settings& s);  // the same on every console for the same settings

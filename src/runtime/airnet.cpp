@@ -13,6 +13,7 @@
 // are all here; no libraries beyond the OS.
 #include "runtime/airnet.h"
 #include "runtime/lanport.h"
+#include "runtime/mapfiles.h"
 #include "runtime/settings.h"
 
 #include <algorithm>
@@ -155,73 +156,73 @@ void splitAddress(const std::string& address, std::string& host, std::string& po
 // ================================================================================================
 namespace detail {
 namespace {
+uint32_t ror(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+}  // namespace
 
-struct Sha256 {
-    uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
-    uint8_t buf[64];
-    size_t used = 0;
-    uint64_t total = 0;
-
-    static uint32_t ror(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
-
-    void block(const uint8_t* p) {
-        static const uint32_t k[64] = {
-            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-        uint32_t w[64];
-        for (int i = 0; i < 16; i++)
-            w[i] = uint32_t(p[4 * i]) << 24 | uint32_t(p[4 * i + 1]) << 16 | uint32_t(p[4 * i + 2]) << 8 | p[4 * i + 3];
-        for (int i = 16; i < 64; i++) {
-            uint32_t s0 = ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
-            uint32_t s1 = ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
-        }
-        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
-        for (int i = 0; i < 64; i++) {
-            uint32_t t1 = hh + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
-            uint32_t t2 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
-            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
-        }
-        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+void Sha256::block(const uint8_t* p) {
+    static const uint32_t k[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = uint32_t(p[4 * i]) << 24 | uint32_t(p[4 * i + 1]) << 16 | uint32_t(p[4 * i + 2]) << 8 | p[4 * i + 3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        uint32_t s1 = ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16] + s0 + w[i - 7] + s1;
     }
-    void update(const void* data, size_t len) {
-        auto* p = static_cast<const uint8_t*>(data);
-        total += len;
-        while (len) {
-            size_t n = std::min(len, size_t(64) - used);
-            std::memcpy(buf + used, p, n);
-            used += n;
-            p += n;
-            len -= n;
-            if (used == 64) {
-                block(buf);
-                used = 0;
-            }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t t1 = hh + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
+        uint32_t t2 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+        hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+}
+
+void Sha256::update(const void* data, size_t len) {
+    auto* p = static_cast<const uint8_t*>(data);
+    total += len;
+    if (used == 0)  // (whole blocks straight from the data: large files hash without the copy)
+        for (; len >= 64; p += 64, len -= 64) block(p);
+    while (len) {
+        size_t n = std::min(len, size_t(64) - used);
+        std::memcpy(buf + used, p, n);
+        used += n;
+        p += n;
+        len -= n;
+        if (used == 64) {
+            block(buf);
+            used = 0;
+            for (; len >= 64; p += 64, len -= 64) block(p);
         }
     }
-    void final(uint8_t out[32]) {
-        uint64_t bits = total * 8;
-        uint8_t pad = 0x80;
-        update(&pad, 1);
-        uint8_t zero = 0;
-        while (used != 56) update(&zero, 1);
-        uint8_t len[8];
-        for (int i = 0; i < 8; i++) len[i] = uint8_t(bits >> (56 - 8 * i));
-        update(len, 8);
-        for (int i = 0; i < 8; i++) {
-            out[4 * i] = uint8_t(h[i] >> 24);
-            out[4 * i + 1] = uint8_t(h[i] >> 16);
-            out[4 * i + 2] = uint8_t(h[i] >> 8);
-            out[4 * i + 3] = uint8_t(h[i]);
-        }
+}
+
+void Sha256::final(uint8_t out[32]) {
+    uint64_t bits = total * 8;
+    uint8_t pad = 0x80;
+    update(&pad, 1);
+    uint8_t zero = 0;
+    while (used != 56) update(&zero, 1);
+    uint8_t len[8];
+    for (int i = 0; i < 8; i++) len[i] = uint8_t(bits >> (56 - 8 * i));
+    update(len, 8);
+    for (int i = 0; i < 8; i++) {
+        out[4 * i] = uint8_t(h[i] >> 24);
+        out[4 * i + 1] = uint8_t(h[i] >> 16);
+        out[4 * i + 2] = uint8_t(h[i] >> 8);
+        out[4 * i + 3] = uint8_t(h[i]);
     }
-};
+}
+
+namespace {
 
 struct Hmac {
     Sha256 inner, outer;
@@ -786,6 +787,25 @@ constexpr uint8_t kStreamMagic[8] = {'A', 'I', 'R', 'R', 'E', 'L', 'A', 'Y'};
 constexpr size_t kStreamQueue = 64 * 1024;  // bytes waiting for the socket at most: past that, frames are dropped
 constexpr int64_t kUdpTrialMs = 1500;       // no answer over UDP for this long: TCP
 constexpr size_t kChatKeep = 100;
+// City Trial maps (docs/ONLINE.md, "Maps"): a console without the lobby's map gets it from the host's, in Ethernet
+// frames of a type of their own - relayed to that one console (FRAME_TO) or peer to peer as kP2pMap - never handed to
+// the game. A frame: the Ethernet header, then kind u8, version u8, 0 u16, the map's id (its hash's first 8 bytes), then
+//   ASK  (to the host)   -                          INFO (to it)  total u32, manifest u32, chunk size u16
+//   DATA (to it)         chunk number u32, bytes    ACK  (to the host)  first missing u32, n u16, n bytes: a bit per chunk
+//   DONE (to the host)   -: stop sending            GONE (to it)  -: the host has no such map to send
+// The host sends the packed map (src/runtime/mapfiles.h) in chunks, at most kMapWindow beyond the first one not
+// acknowledged, paced; what is not acknowledged in time goes again.
+constexpr uint8_t kP2pMap = 0x13;  // + one map frame (only from a checked address)
+constexpr uint8_t kMapAsk = 1, kMapInfo = 2, kMapData = 3, kMapAck = 4, kMapDone = 5, kMapGone = 6;
+constexpr uint16_t kMapEtherType = 0x88B6;
+constexpr uint8_t kMapVersion = 1;
+constexpr size_t kMapHead = 14 + 4 + 8;     // Ethernet header, kind / version / 0, the map's id
+constexpr size_t kMapChunk = 1200;          // bytes of the map a frame
+constexpr uint32_t kMapWindow = 1024;       // chunks sent and not yet acknowledged, at most
+constexpr int kMapRelayRate = 400;          // chunks a second through the relay (every console sent to, together) ...
+constexpr int kMapDirectRate = 2000;        // ... and to each console peer to peer
+constexpr int kMapUploads = 16;             // consoles the host sends to at once
+bool isMapFrame(const uint8_t* f, size_t len) { return len >= 14 && f[12] == uint8_t(kMapEtherType >> 8) && f[13] == uint8_t(kMapEtherType); }
 
 const char* modeId(Mode m) {
     switch (m) {
@@ -865,6 +885,7 @@ Lobby parseLobby(const Json& j) {
         x.relayTcp = m["relay_tcp"].flag();
         x.away = m["away"].flag();
         x.pingMs = int(m["ping"].num(-1));
+        x.mapOk = m["map_ok"].str();
         if (x.player) roster.members.push_back(x.name);
         l.members.push_back(std::move(x));
     }
@@ -989,6 +1010,9 @@ struct Client::Impl {
     ~Impl() {
         stopThread();
         if (job.valid()) job.wait();  // it wakes this thread through wakeSock when done
+        if (fetch.check.valid()) fetch.check.wait();  // (the maps' workers likewise)
+        if (fetch.install.valid()) fetch.install.wait();
+        if (serve.loading.valid()) serve.loading.wait();
         if (installPort && lan::port() == &portObj) lan::setPort(prevPort);
         closeTcp();
         closeUdp();
@@ -1134,6 +1158,52 @@ struct Client::Impl {
     int64_t stunNext = 0;
     int stunTries = 0;
     size_t stunIdx = 0;
+    // City Trial maps: this console's copy of the lobby's map, and (the host) sending it to consoles without it
+    struct MapWant {
+        std::string folder, title, hash;  // the lobby's settings' "map" (folder "": none - the city)
+        uint64_t size = 0;
+    } mapWant;
+    std::string mapsRoot = mapfiles::defaultRoot();
+    enum class Fetch : uint8_t { Idle, Checking, Asking, Receiving, Installing, Ready, Failed };
+    struct {
+        Fetch stage = Fetch::Idle;
+        std::string hash;                  // the map looked for (mapWant's)
+        uint8_t id[8] = {};
+        uint32_t host = 0;                 // the console it comes from: the lobby host's (peer id)
+        uint32_t total = 0, manifest = 0, chunks = 0, got = 0, base = 0, sinceAck = 0;
+        std::vector<uint8_t> data, have;   // the packed map as it comes; per chunk, whether it came
+        int64_t since = 0, lastAsk = 0, lastAck = 0, lastData = 0, retryAt = 0, shownAt = 0;
+        std::future<std::string> check;    // (a worker) the installed copy's folder; empty: none
+        std::string checkFor;
+        std::future<std::pair<bool, std::string>> install;  // (a worker) put in place: the folder, or why not
+        std::string installFor;
+    } fetch;
+    std::string mapOkSent = "-";           // what the master was told this console has ("-": nothing yet)
+    struct Packed {
+        bool ok = false;
+        std::vector<uint8_t> data;
+        uint32_t manifest = 0;
+    };
+    struct Upload {                        // the host sending the map to one console
+        uint32_t peer = 0;
+        std::vector<uint8_t> acked;        // per chunk
+        std::vector<int64_t> sentAt;       // per chunk: when it last went (0: never, or again at once)
+        uint32_t base = 0, next = 0;       // the first not acknowledged; the first never sent
+        int64_t lastHeard = 0;
+        double tokens = 0;                 // (peer to peer: its own pace)
+    };
+    struct {
+        std::string hash;                  // the map sent (the lobby's)
+        uint8_t id[8] = {};
+        std::shared_ptr<const Packed> packed;
+        std::future<std::shared_ptr<const Packed>> loading;  // (a worker) found and packed
+        std::string loadingFor;
+        std::vector<uint32_t> waiting;     // consoles that asked while it was being packed (answered then)
+        std::vector<Upload> uploads;
+        double relayTokens = 0;
+        int64_t lastUse = 0, tickAt = 0;
+        size_t turn = 0;
+    } serve;
 
     // ================================================================================================
     // Threading
@@ -1221,7 +1291,8 @@ struct Client::Impl {
                     if (streamPending()) add(st, wr);
                 }
             }
-            timeval tv{0, 50 * 1000};  // timers tick at least 20 times a second
+            // timers tick at least 20 times a second (200 while a map is sent or comes: its pace and acknowledgements)
+            timeval tv{0, mapBusy() ? 5 * 1000 : 50 * 1000};
             int n = select(int(maxFd + 1), &rd, &wr, &ex, &tv);
             if (n < 0) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -1865,6 +1936,7 @@ struct Client::Impl {
             peerInfoDirty = true;  // tell the master where this console can be reached
             lanCands.clear();
         }
+        mapOkSent = "-";  // (the master is told the map this console has again)
         applyLobby(lobby);
     }
 
@@ -1878,6 +1950,7 @@ struct Client::Impl {
         cur.myGroup = cur.player ? 1 : 0;
         updateGroup();
         refreshPaths(nowMs(), true);
+        mapLobby();
         changed();
     }
 
@@ -1888,6 +1961,7 @@ struct Client::Impl {
         cur.player = false;
         cur.myGroup = 0;
         cur.chat.clear();
+        mapLobby();  // (no lobby: no map)
         relayKnown = false;
         {
             std::lock_guard<std::mutex> lock(relayMu);
@@ -2181,9 +2255,10 @@ struct Client::Impl {
         const uint8_t type = d[0];
         const uint32_t id = rd32be(d + 4);
         const int64_t now = nowMs();
-        if (type == kP2pFrame) {
+        if (type == kP2pFrame || type == kP2pMap) {
             const size_t len = n - kRelayHeader;
-            if (len < kFrameMin || len > kFrameMax || !inGroup.load(std::memory_order_relaxed)) return;
+            const bool map = type == kP2pMap || isMapFrame(d + kRelayHeader, len);  // (a map's: never the game's)
+            if (len < kFrameMin || len > kFrameMax || (!map && !inGroup.load(std::memory_order_relaxed))) return;
             {
                 std::lock_guard<std::mutex> lock(relayMu);
                 Peer* p = findPeer(id);
@@ -2192,7 +2267,8 @@ struct Client::Impl {
                 for (auto& c : p->cands) ok = ok || (c.works && sameAddr(c.addr, from));
                 if (!ok) return;
             }
-            pushFrame(d + kRelayHeader, len);
+            if (map) mapFrame(id, d + kRelayHeader, len);
+            else pushFrame(d + kRelayHeader, len);
             return;
         }
         if ((type != kP2pPing && type != kP2pPong) || n < kRelayHeader + 16 || !p2pEnabled()) return;
@@ -2495,7 +2571,11 @@ struct Client::Impl {
         if (n < kRelayHeader || d[1] != kRelayVersion) return;
         if (d[0] == kRelayFrame) {
             size_t len = n - kRelayHeader;
-            if (len < kFrameMin || len > kFrameMax || !inGroup.load(std::memory_order_relaxed)) return;
+            if (len < kFrameMin || len > kFrameMax) return;
+            // A map's frame (to this console, from the relay id in its header - the master checked it is theirs): never
+            // the game's, and it comes whether or not this console plays.
+            if (isMapFrame(d + kRelayHeader, len)) return mapFrame(rd32be(d + 4), d + kRelayHeader, len);
+            if (!inGroup.load(std::memory_order_relaxed)) return;
             pushFrame(d + kRelayHeader, len);
         } else if (d[0] == kRelayHelloAck && n >= kRelayHeader + 4) {
             if (viaTcp != relayTcp.load()) return;  // a late answer by the transport left behind
@@ -2839,6 +2919,456 @@ struct Client::Impl {
                                       "The match connection does not answer: a firewall may be blocking it.");
             }
         }
+        mapTick(now);
+    }
+
+    // ================================================================================================
+    // City Trial maps: the lobby's, downloaded from the host's console when this PC has no copy
+    // ================================================================================================
+
+    static void mapId(const std::string& hash, uint8_t id[8]) {
+        std::vector<uint8_t> b;
+        std::memset(id, 0, 8);
+        if (unhex(hash.substr(0, 16), b) && b.size() == 8) std::memcpy(id, b.data(), 8);
+    }
+    static bool validHash(const std::string& h) {
+        std::vector<uint8_t> b;
+        return h.size() == 64 && unhex(h, b);
+    }
+
+    bool mapBusy() const { return !serve.uploads.empty() || fetch.stage == Fetch::Receiving; }
+
+    void mapShow(MapState st, float progress = 0, const std::string& error = {}) {
+        if (cur.mapState == st && cur.mapProgress == progress && cur.mapError == error && cur.mapTitle == mapWant.title) return;
+        cur.mapState = st;
+        cur.mapProgress = progress;
+        cur.mapError = error;
+        cur.mapTitle = mapWant.title;
+        changed();
+    }
+
+    // A map frame's start: the Ethernet header (to no MAC: the relay or the peer-to-peer path addresses it), the kind
+    // and the map's id.
+    void mapHeader(uint8_t* f, uint8_t kind, const uint8_t id[8]) {
+        std::memset(f, 0, 6);
+        myMac(f + 6);
+        f[12] = uint8_t(kMapEtherType >> 8);
+        f[13] = uint8_t(kMapEtherType);
+        f[14] = kind;
+        f[15] = kMapVersion;
+        f[16] = f[17] = 0;
+        std::memcpy(f + 18, id, 8);
+    }
+
+    // Whether frames to that console go peer to peer.
+    bool mapDirect(uint32_t to) {
+        std::lock_guard<std::mutex> lock(relayMu);
+        const Peer* p = findPeer(to);
+        return p && p->best >= 0 && p2pEnabled();
+    }
+
+    // A map frame to one console: peer to peer where a direct path works, else through the relay (FRAME_TO naming it).
+    // False if it could not go now (no relay yet, the stream backed up, the socket full).
+    bool mapSend(uint32_t to, const uint8_t* frame, size_t len) {
+        uint8_t msg[2 + kRelayHeader + 5 + kFrameMax];  // (the length prefix is for the stream)
+        uint8_t* d = msg + 2;
+        if (len > kFrameMax || !to) return false;
+        std::lock_guard<std::mutex> lock(relayMu);
+        if (!relayId) return false;
+        if (p2pEnabled())
+            if (const Peer* p = findPeer(to); p && p->best >= 0) {
+                p2pHeader(d, kP2pMap);
+                std::memcpy(d + kRelayHeader, frame, len);
+                return udpSendLocked(p->cands[size_t(p->best)].addr, d, kRelayHeader + len) > 0;
+            }
+        d[0] = kRelayFrameTo;
+        d[1] = kRelayVersion;
+        d[2] = d[3] = 0;
+        wr32be(d + 4, relayId);
+        d[8] = 1;
+        wr32be(d + 9, to);
+        std::memcpy(d + kRelayHeader + 5, frame, len);
+        const size_t total = kRelayHeader + 5 + len;
+        if (relayTcp.load(std::memory_order_relaxed)) {
+            msg[0] = uint8_t(total >> 8);
+            msg[1] = uint8_t(total);
+            return streamWriteLocked(msg, total + 2);
+        }
+        return udpSendLocked(udpAddr, d, total) > 0;
+    }
+
+    // The lobby's settings (or its host) may have changed: the map looked for again if it is another.
+    void mapLobby() {
+        MapWant w;
+        Json j;
+        if (cur.inLobby && JsonReader(cur.lobby.settingsJson).parse(j)) {
+            const Json& m = j["map"];
+            w.folder = m["folder"].str();
+            w.title = m["title"].str();
+            w.hash = lower(m["hash"].str());
+            w.size = uint64_t(std::max<int64_t>(0, m["size"].num()));
+        }
+        if (w.folder.empty()) w = MapWant{};
+        if (w.title.empty()) w.title = w.folder;
+        uint32_t host = 0;
+        for (auto& m : cur.lobby.members)
+            if (m.host) host = m.peerId;
+        if (host != fetch.host) {  // (a new host: asked at once, what came so far kept - the same map packs the same)
+            fetch.host = host;
+            if (fetch.stage == Fetch::Asking || fetch.stage == Fetch::Receiving) fetch.lastAsk = 0, fetch.since = nowMs();
+        }
+        if (!cur.isHost && (serve.packed || !serve.uploads.empty())) {  // (no longer the host: no longer sending)
+            serve.packed.reset();
+            serve.uploads.clear();
+            serve.waiting.clear();
+        }
+        const bool same = w.folder == mapWant.folder && w.hash == mapWant.hash;
+        mapWant = w;
+        if (same) {
+            if (cur.mapTitle != mapWant.title) mapShow(cur.mapState, cur.mapProgress, cur.mapError);
+            return;
+        }
+        if (fetch.stage == Fetch::Asking || fetch.stage == Fetch::Receiving) mapTell(kMapDone);  // (the old one: no more)
+        fetch.data.clear();
+        fetch.data.shrink_to_fit();
+        fetch.have.clear();
+        fetch.total = fetch.manifest = fetch.chunks = fetch.got = fetch.base = 0;
+        serve.packed.reset();
+        serve.uploads.clear();
+        serve.waiting.clear();
+        serve.hash = mapWant.hash;
+        mapId(serve.hash, serve.id);
+        fetch.hash = mapWant.hash;
+        mapId(fetch.hash, fetch.id);
+        if (mapWant.folder.empty()) {
+            fetch.stage = Fetch::Idle;
+            mapShow(MapState::None);
+            return;
+        }
+        log("[online] the server's map: %s (%s, %s)\n", mapWant.title.c_str(), mapWant.folder.c_str(), mapWant.hash.c_str());
+        if (!validHash(mapWant.hash)) return mapFailed(nowMs(), "The server's map setting is not one this game reads.");
+        fetch.stage = Fetch::Checking;
+        mapShow(MapState::Checking);
+        mapCheck();
+    }
+
+    // This PC's map mods looked through for the lobby's map (on a worker: hashing reads them). One at a time: one still
+    // running is looked at when it is done (and another started if the lobby's map changed meanwhile).
+    void mapCheck() {
+        if (fetch.check.valid()) return;
+        fetch.checkFor = fetch.hash;
+        fetch.check = std::async(std::launch::async, [this, root = mapsRoot, folder = mapWant.folder, hash = mapWant.hash] {
+            std::string found = mapfiles::find(root, folder, hash);
+            wake();
+            return found;
+        });
+    }
+
+    void mapFailed(int64_t now, const std::string& why) {
+        fetch.stage = Fetch::Failed;
+        fetch.retryAt = now + 15000;  // (and again)
+        fetch.data.clear();
+        fetch.data.shrink_to_fit();
+        fetch.have.clear();
+        fetch.total = fetch.manifest = fetch.chunks = fetch.got = fetch.base = 0;
+        mapShow(MapState::Failed, 0, why);
+        log("[online] the server's map %s: %s\n", mapWant.title.c_str(), why.c_str());
+    }
+
+    void mapTell(uint8_t kind) {  // ASK or DONE, to the host
+        uint8_t f[kMapHead];
+        mapHeader(f, kind, fetch.id);
+        mapSend(fetch.host, f, sizeof f);
+    }
+
+    void mapAck(int64_t now) {
+        uint8_t f[kMapHead + 6 + kMapWindow / 8];
+        mapHeader(f, kMapAck, fetch.id);
+        const uint32_t cover = std::min(kMapWindow, fetch.chunks - fetch.base), bytes = (cover + 7) / 8;
+        wr32be(f + kMapHead, fetch.base);
+        f[kMapHead + 4] = uint8_t(bytes >> 8);
+        f[kMapHead + 5] = uint8_t(bytes);
+        std::memset(f + kMapHead + 6, 0, bytes);
+        for (uint32_t k = 0; k < cover; k++)
+            if (fetch.have[fetch.base + k]) f[kMapHead + 6 + k / 8] |= uint8_t(1u << (k % 8));
+        mapSend(fetch.host, f, kMapHead + 6 + bytes);
+        fetch.lastAck = now;
+        fetch.sinceAck = 0;
+    }
+
+    // Every chunk came: the host told, the map put in place on a worker (its files checked there).
+    void mapReceived(int64_t now) {
+        mapTell(kMapDone);
+        mapTell(kMapDone);  // (twice: a datagram may be lost)
+        fetch.lastAck = now;
+        fetch.stage = Fetch::Installing;
+        mapShow(MapState::Downloading, 1.f);
+        if (fetch.install.valid()) fetch.install.wait();  // (one before it, of another map, still being put in place)
+        fetch.installFor = fetch.hash;
+        fetch.install = std::async(std::launch::async, [this, root = mapsRoot, folder = mapWant.folder, hash = fetch.hash,
+                                                        data = std::move(fetch.data), manifest = fetch.manifest] {
+            std::string error, placed;
+            const bool ok = mapfiles::install(root, folder, hash, data, manifest, error, &placed);
+            wake();
+            return std::make_pair(ok, ok ? placed : error);
+        });
+        fetch.data = {};
+        fetch.have.clear();
+    }
+
+    // A map frame from the console with relay id `from` (the relay, or peer to peer from a checked address).
+    void mapFrame(uint32_t from, const uint8_t* f, size_t len) {
+        if (len < kMapHead || f[15] != kMapVersion || !cur.inLobby) return;
+        const uint8_t kind = f[14], *id = f + 18, *b = f + kMapHead;
+        const size_t bn = len - kMapHead;
+        const int64_t now = nowMs();
+        if (kind == kMapAsk || kind == kMapAck || kind == kMapDone) return serveFrame(from, kind, id, b, bn, now);
+        if (from != fetch.host || std::memcmp(id, fetch.id, 8) != 0) return;
+        if (kind == kMapInfo) {
+            if ((fetch.stage != Fetch::Asking && fetch.stage != Fetch::Receiving) || bn < 10) return;
+            const uint32_t total = rd32be(b), manifest = rd32be(b + 4), chunk = uint32_t(b[8]) << 8 | b[9];
+            if (manifest < 9 || manifest > total || total > mapfiles::kBytesMax + (4u << 20) || chunk != kMapChunk ||
+                (mapWant.size && total - manifest != mapWant.size)) {
+                mapTell(kMapDone);
+                return mapFailed(now, "The host's map is not the one in the settings.");
+            }
+            fetch.lastData = now;
+            if (fetch.stage == Fetch::Receiving && total == fetch.total && manifest == fetch.manifest) return;
+            if (total != fetch.total || manifest != fetch.manifest || fetch.data.size() != total) {
+                fetch.total = total;
+                fetch.manifest = manifest;
+                fetch.chunks = (total + uint32_t(kMapChunk) - 1) / uint32_t(kMapChunk);
+                fetch.data.assign(total, 0);
+                fetch.have.assign(fetch.chunks, 0);
+                fetch.got = fetch.base = 0;
+            }
+            if (fetch.stage != Fetch::Receiving)
+                log("[online] the server's map %s: downloading %u bytes from the host's console (%s)\n", mapWant.title.c_str(), total,
+                    mapDirect(from) ? "peer to peer" : "through the relay");
+            fetch.stage = Fetch::Receiving;
+            fetch.lastAck = 0;
+            if (fetch.got == fetch.chunks) mapReceived(now);
+        } else if (kind == kMapData) {
+            if ((fetch.stage == Fetch::Installing || fetch.stage == Fetch::Ready) && now - fetch.lastAck >= 250) {
+                fetch.lastAck = now;  // (all came, but the host still sends: its DONE was lost)
+                mapTell(kMapDone);
+            }
+            if (fetch.stage != Fetch::Receiving || bn < 4) return;
+            const uint32_t i = rd32be(b);
+            if (i >= fetch.chunks) return;
+            const size_t at = size_t(i) * kMapChunk, n = std::min(kMapChunk, size_t(fetch.total) - at);
+            if (bn - 4 != n) return;
+            fetch.lastData = now;
+            fetch.sinceAck++;  // (a chunk that came twice too: the host does not know it came)
+            if (fetch.have[i]) return;
+            std::memcpy(fetch.data.data() + at, b + 4, n);
+            fetch.have[i] = 1;
+            fetch.got++;
+            while (fetch.base < fetch.chunks && fetch.have[fetch.base]) fetch.base++;
+            if (fetch.got == fetch.chunks) mapReceived(now);
+        } else if (kind == kMapGone) {
+            if (fetch.stage == Fetch::Asking || fetch.stage == Fetch::Receiving)
+                mapFailed(now, "The host's console does not have the map to send.");
+        }
+    }
+
+    // ---- the host: the lobby's map, packed (on a worker), sent to each console that asks
+    void serveFrame(uint32_t from, uint8_t kind, const uint8_t* id, const uint8_t* b, size_t bn, int64_t now) {
+        const bool ours = cur.isHost && !mapWant.folder.empty() && std::memcmp(id, serve.id, 8) == 0;
+        auto find = [&]() -> Upload* {
+            for (auto& u : serve.uploads)
+                if (u.peer == from) return &u;
+            return nullptr;
+        };
+        if (kind == kMapAsk) {
+            if (!ours || (serve.packed && !serve.packed->ok)) {
+                uint8_t f[kMapHead];
+                mapHeader(f, kMapGone, id);
+                mapSend(from, f, sizeof f);
+                return;
+            }
+            serve.lastUse = now;
+            if (!serve.packed) {  // (answered once the map is packed)
+                if (std::find(serve.waiting.begin(), serve.waiting.end(), from) == serve.waiting.end()) serve.waiting.push_back(from);
+                return serveLoad();
+            }
+            Upload* u = find();
+            if (!u) {
+                if (int(serve.uploads.size()) >= kMapUploads) return;
+                Upload n;
+                n.peer = from;
+                const uint32_t chunks = uint32_t((serve.packed->data.size() + kMapChunk - 1) / kMapChunk);
+                n.acked.assign(chunks, 0);
+                n.sentAt.assign(chunks, 0);
+                serve.uploads.push_back(std::move(n));
+                u = &serve.uploads.back();
+                log("[online] sending the map %s to console %08X (%s)\n", mapWant.title.c_str(), from, mapDirect(from) ? "peer to peer" : "through the relay");
+            }
+            u->lastHeard = now;
+            for (uint32_t i = u->base; i < u->next; i++) u->sentAt[i] = 0;  // (asked again: what is not acknowledged goes at once)
+            uint8_t f[kMapHead + 10];
+            mapHeader(f, kMapInfo, serve.id);
+            wr32be(f + kMapHead, uint32_t(serve.packed->data.size()));
+            wr32be(f + kMapHead + 4, serve.packed->manifest);
+            f[kMapHead + 8] = uint8_t(kMapChunk >> 8);
+            f[kMapHead + 9] = uint8_t(kMapChunk);
+            mapSend(from, f, sizeof f);
+        } else if (kind == kMapAck) {
+            Upload* u = ours ? find() : nullptr;
+            if (!u || bn < 6) return;
+            const uint32_t base = rd32be(b), bytes = uint32_t(b[4]) << 8 | b[5], chunks = uint32_t(u->acked.size());
+            if (bn < 6 + size_t(bytes)) return;
+            u->lastHeard = now;
+            serve.lastUse = now;
+            for (uint32_t i = u->base; i < std::min(base, chunks); i++) u->acked[i] = 1;
+            for (uint32_t k = 0; k < bytes * 8 && base + k < chunks; k++)
+                if (b[6 + k / 8] >> (k % 8) & 1) u->acked[base + k] = 1;
+            while (u->base < chunks && u->acked[u->base]) u->base++;
+            u->next = std::max(u->next, u->base);
+        } else if (kind == kMapDone) {
+            serve.uploads.erase(std::remove_if(serve.uploads.begin(), serve.uploads.end(), [&](const Upload& u) { return u.peer == from; }),
+                                serve.uploads.end());
+        }
+    }
+
+    void serveLoad() {
+        if (serve.loading.valid()) return;
+        serve.loadingFor = mapWant.hash;
+        serve.loading = std::async(std::launch::async, [this, root = mapsRoot, folder = mapWant.folder, hash = mapWant.hash] {
+            auto p = std::make_shared<Packed>();
+            const std::string found = mapfiles::find(root, folder, hash);
+            std::string got;
+            p->ok = !found.empty() && mapfiles::pack(mapfiles::dirOf(root, found), p->data, p->manifest, got) && got == hash;
+            if (!p->ok) p->data.clear();
+            wake();
+            return std::shared_ptr<const Packed>(std::move(p));
+        });
+    }
+
+    bool sendChunk(Upload& u, uint32_t i, int64_t now) {
+        const Packed& p = *serve.packed;
+        uint8_t f[kMapHead + 4 + kMapChunk];
+        mapHeader(f, kMapData, serve.id);
+        wr32be(f + kMapHead, i);
+        const size_t at = size_t(i) * kMapChunk, n = std::min(kMapChunk, p.data.size() - at);
+        std::memcpy(f + kMapHead + 4, p.data.data() + at, n);
+        if (!mapSend(u.peer, f, kMapHead + 4 + n)) return false;
+        u.sentAt[i] = now;
+        return true;
+    }
+
+    void serveTick(int64_t now) {
+        if (serve.loading.valid() && serve.loading.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            std::shared_ptr<const Packed> p = serve.loading.get();
+            if (serve.loadingFor == serve.hash && cur.isHost) {
+                serve.packed = p;
+                log("[online] the server's map %s: %s\n", mapWant.title.c_str(),
+                    p->ok ? (std::to_string(p->data.size()) + " bytes packed for sending").c_str() : "not found on this PC to send");
+                std::vector<uint32_t> asked;
+                asked.swap(serve.waiting);
+                for (uint32_t peer : asked) serveFrame(peer, kMapAsk, serve.id, nullptr, 0, now);
+            }
+        }
+        for (size_t k = serve.uploads.size(); k-- > 0;)
+            if (now - serve.uploads[k].lastHeard > 15000) {
+                log("[online] the map: console %08X stopped answering\n", serve.uploads[k].peer);
+                serve.uploads.erase(serve.uploads.begin() + std::ptrdiff_t(k));
+            }
+        const double dt = std::clamp(double(now - serve.tickAt) / 1000.0, 0.0, 0.1);
+        serve.tickAt = now;
+        if (serve.uploads.empty() || !serve.packed || !serve.packed->ok) {
+            if (serve.uploads.empty() && serve.packed && now - serve.lastUse > 60000) serve.packed.reset();  // (nobody asked for a while)
+            serve.relayTokens = 0;
+            return;
+        }
+        // the pace: every console through the relay together, each peer to peer on its own; a little saved up at most
+        // (a match on - those waiting for the next one get the map meanwhile - a quarter through the relay: the match's
+        // own frames keep the host's connection)
+        const double relayRate = cur.lobby.session == SessionState::InMatch ? kMapRelayRate / 4.0 : double(kMapRelayRate);
+        serve.relayTokens = std::min(serve.relayTokens + dt * relayRate, relayRate / 20.0);
+        const uint32_t chunks = uint32_t((serve.packed->data.size() + kMapChunk - 1) / kMapChunk);
+        const size_t n = serve.uploads.size();
+        for (size_t k = 0; k < n; k++) {
+            Upload& u = serve.uploads[(serve.turn + k) % n];
+            const bool direct = mapDirect(u.peer);
+            if (direct) u.tokens = std::min(u.tokens + dt * kMapDirectRate, kMapDirectRate / 20.0);
+            double& tokens = direct ? u.tokens : serve.relayTokens;
+            const int64_t again = direct ? 300 : 1000;  // (not acknowledged by then: sent again)
+            bool sent = true;
+            for (uint32_t i = u.base, end = std::min(u.next, u.base + kMapWindow); i < end && tokens >= 1 && sent; i++)
+                if (!u.acked[i] && now - u.sentAt[i] >= again && (sent = sendChunk(u, i, now))) tokens -= 1;
+            while (sent && tokens >= 1 && u.next < chunks && u.next < u.base + kMapWindow && (sent = sendChunk(u, u.next, now)))
+                u.next++, tokens -= 1;
+        }
+        serve.turn++;
+    }
+
+    void mapTick(int64_t now) {
+        if (fetch.check.valid() && fetch.check.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            const std::string found = fetch.check.get();
+            if (fetch.stage != Fetch::Checking) {
+            } else if (fetch.checkFor != fetch.hash) {
+                mapCheck();  // (the lobby's map changed while it looked: again)
+            } else if (!found.empty()) {
+                fetch.stage = Fetch::Ready;
+                mapShow(MapState::Ready);
+                log("[online] the server's map %s: on this PC (%s)\n", mapWant.title.c_str(), found.c_str());
+            } else if (cur.isHost) {
+                mapFailed(now, "This PC's copy of the map changed: choose the stage again.");
+            } else {
+                fetch.stage = Fetch::Asking;
+                fetch.since = now;
+                fetch.lastAsk = 0;
+                mapShow(MapState::Downloading, 0);
+            }
+        }
+        if (fetch.install.valid() && fetch.install.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            const auto [ok, what] = fetch.install.get();
+            if (fetch.stage == Fetch::Installing && fetch.installFor == fetch.hash) {
+                if (ok) {
+                    fetch.stage = Fetch::Ready;
+                    mapShow(MapState::Ready);
+                } else {
+                    mapFailed(now, what);
+                }
+            }
+        }
+        switch (fetch.stage) {
+        case Fetch::Asking:
+        case Fetch::Receiving:
+            if (cur.isHost) {  // (the host left and this console hosts now: nobody to get it from)
+                mapFailed(now, "The host left before the map came: choose another stage.");
+                break;
+            }
+            if (fetch.stage == Fetch::Asking) {
+                if (now - fetch.lastAsk >= 1000) fetch.lastAsk = now, mapTell(kMapAsk);
+                if (now - fetch.since > 30000) mapFailed(now, "The host's console did not send the map.");
+                break;
+            }
+            if ((fetch.sinceAck && now - fetch.lastAck >= 40) || now - fetch.lastAck >= 500) mapAck(now);
+            if (now - fetch.lastData > 6000) {  // (nothing for a while: asked again - what came is kept)
+                fetch.stage = Fetch::Asking;
+                fetch.since = now;
+                fetch.lastAsk = 0;
+            }
+            if (now - fetch.shownAt >= 100 && fetch.chunks) fetch.shownAt = now, mapShow(MapState::Downloading, float(fetch.got) / float(fetch.chunks));
+            break;
+        case Fetch::Failed:
+            if (now >= fetch.retryAt && !mapWant.folder.empty() && validHash(mapWant.hash)) {
+                fetch.stage = Fetch::Checking;
+                mapShow(MapState::Checking);
+                mapCheck();
+            }
+            break;
+        default: break;
+        }
+        // the master told what this console has (a match on a map waits for every player's)
+        const std::string ok = fetch.stage == Fetch::Ready ? fetch.hash : std::string();
+        if (cur.inLobby && phase == Phase::Ready && cur.loggedIn && ok != mapOkSent) {
+            sendLine(Msg("map_status").str("map_ok", ok).finish(0));
+            mapOkSent = ok;
+        }
+        serveTick(now);
     }
 };
 
@@ -3127,6 +3657,11 @@ void detail::setMacAddress(Client& client, const uint8_t mac[6]) {
     std::lock_guard<std::mutex> lock(i->relayMu);
     std::memcpy(i->macOverride, mac, 6);
     i->macSet = true;
+}
+
+void detail::setMapsFolder(Client& client, const std::string& folder) {
+    Client::Impl* i = client.impl_.get();
+    i->post([i, folder] { i->mapsRoot = folder; });
 }
 
 // ================================================================================================

@@ -10,5 +10,12 @@ std::string name(int i);       // as shown: the city's, or the mod's own (mod.js
 int selected();
 void select(int i);            // served from the next match on (and kept in the settings)
 void rescan();                 // the mods folder looked at again (the choice kept if still there)
+// (The game's thread, as each of these serves files to it.)
+
+// An online session's stage (src/runtime/lansession.cpp, as each match starts): the map mod with this content
+// (src/runtime/mapfiles.h: its hash), looked for in `folder` first; folder "": the city. Served without being kept in
+// the settings; false (nothing changed) if this PC has no such map. endSession() serves the player's own choice again.
+bool selectForSession(const std::string& folder, const std::string& hash);
+void endSession();
 
 }  // namespace rt::maps

@@ -140,7 +140,7 @@ endif ()
 # Not part of the default build: `ninja airnet_test`. server/tests/test_cpp_client.py runs it against
 # a server it starts itself (docs/ONLINE.md).
 add_executable(airnet_test EXCLUDE_FROM_ALL
-    server/tests/cpp/airnet_test.cpp src/runtime/airnet.cpp src/runtime/settings.cpp)
+    server/tests/cpp/airnet_test.cpp src/runtime/airnet.cpp src/runtime/mapfiles.cpp src/runtime/settings.cpp)
 target_include_directories(airnet_test PRIVATE src)
 if (MSVC)
     target_compile_options(airnet_test PRIVATE /EHsc)

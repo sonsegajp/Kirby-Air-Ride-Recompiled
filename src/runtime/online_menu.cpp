@@ -36,6 +36,7 @@
 #include "runtime/airnet.h"
 #include "runtime/kirbymodel.h"
 #include "runtime/lanport.h"
+#include "runtime/mapfiles.h"
 #include "runtime/menu.h"
 #include "runtime/menustyle.h"
 #include "runtime/online_game.h"
@@ -64,6 +65,7 @@
 #include <ctime>
 #include <deque>
 #include <functional>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -271,6 +273,49 @@ struct Forms {
 an::Snapshot s;  // airnet's state, read once a frame
 // The most consoles a match can have here: 8 in the 8-player build (src/runtime/morepl.h), else the game's 4.
 int maxMatchPlayers() { return morepl::active() ? an::kMatchMax : 4; }
+
+// The map mods on this PC, for the host's Stage choice (src/runtime/mapfiles.h): looked through on a worker - each
+// one's hash read from all its files - as a server opens, and when a map has come.
+struct MapList {
+    std::vector<mapfiles::Map> maps;
+    std::future<std::vector<mapfiles::Map>> scanning;
+    bool scanned = false;
+    bool wasInLobby = false;
+    an::MapState wasState = an::MapState::None;
+} g_maps;
+
+void scanMaps() {
+    if (g_maps.scanning.valid()) return;  // (one at a time)
+    g_maps.scanning = std::async(std::launch::async, [] { return mapfiles::scan(mapfiles::defaultRoot(), true); });
+}
+void mapsFrame() {
+    if ((s.inLobby && !g_maps.wasInLobby) || (s.mapState == an::MapState::Ready && g_maps.wasState != an::MapState::Ready)) scanMaps();
+    g_maps.wasInLobby = s.inLobby;
+    g_maps.wasState = s.mapState;
+    if (g_maps.scanning.valid() && g_maps.scanning.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        g_maps.maps = g_maps.scanning.get();
+        g_maps.scanned = true;
+    }
+}
+
+// The lobby's stage (its settings' map; folder "": the city), worked out again only when the settings change.
+const game::Stage& lobbyStage() {
+    static std::string s_json;
+    static game::Stage s_stage;
+    if (s_json != s.lobby.settingsJson) {
+        s_json = s.lobby.settingsJson;
+        const game::Settings st = game::Settings::fromJson(s_json);
+        s_stage = st.mode == game::kCityTrial ? st.stage : game::Stage{};
+    }
+    return s_stage;
+}
+// A player of the next match without the stage's map (the match waits for them).
+bool lacksMap(const an::Member& m) { return m.player && !lobbyStage().folder.empty() && m.mapOk != lobbyStage().hash; }
+int playersWithoutMap() {
+    int n = 0;
+    for (const an::Member& m : s.lobby.members) n += lacksMap(m) ? 1 : 0;
+    return n;
+}
 
 an::Client& net() { return an::client(); }
 double nowT() { return ImGui::GetCurrentContext() ? ImGui::GetTime() : 0.0; }
@@ -1337,6 +1382,7 @@ std::string sessionHelp() {
     default: break;
     }
     if (playersIn() < 2) return "Waiting for another player to join.";
+    if (playersWithoutMap()) return "The match waits until every player has the stage's map.";
     if (L.hold || !L.autoStart) return s.isHost ? "Start the match when everyone is ready (X)." : "The host starts the match.";
     return "The match starts shortly.";
 }
@@ -1345,6 +1391,7 @@ std::string sessionHelp() {
 std::string pathText(const an::Member& m) {
     if (m.name == s.me.username) return "you";
     if (m.away) return "away";
+    if (lacksMap(m)) return "getting map";
     if (!m.player || !s.player) return m.pingMs >= 0 ? std::to_string(m.pingMs) + " ms" : "";
     char b[48];
     const char* how = m.path == an::Path::DirectLan ? "LAN" : m.path == an::Path::DirectInternet ? "Direct" : m.path == an::Path::Relay ? "Relay" : "...";
@@ -1354,6 +1401,7 @@ std::string pathText(const an::Member& m) {
 }
 u32 pathColour(const an::Member& m) {
     if (m.away) return 0x8A8494;
+    if (lacksMap(m) && m.name != s.me.username) return kYellow;
     if (!m.player || !s.player || m.name == s.me.username) return 0x9A93A6;
     if (m.path == an::Path::DirectLan || m.path == an::Path::DirectInternet) return 0x7FD08A;
     return 0xF2C14E;
@@ -1513,6 +1561,10 @@ void screenLobby(Frame& fr) {
         default:
             head = playersIn() < 2 ? "Waiting for players" : (L.hold || !L.autoStart) ? "Ready" : "Getting ready";
             sub = playersIn() < 2 ? "A match needs 2 players." : (L.hold || !L.autoStart) ? "The host starts the match." : "The countdown starts any moment.";
+            if (const int n = playersWithoutMap(); n && playersIn() >= 2) {
+                head = "Getting the map";
+                sub = (n == 1 ? std::string("A player is") : std::to_string(n) + " players are") + " still getting " + lobbyStage().title + ".";
+            }
             break;
         }
         gameText(dl, g_font.bold, U(26), ax0 + U(4), y + U(14), col(headCol), head.c_str());
@@ -1523,6 +1575,24 @@ void screenLobby(Frame& fr) {
         }
         if (!sub.empty()) gameText(dl, g_font.text, U(16), ax0 + U(4), y + U(50), col(0xB8B0C4), sub.c_str());
         y += U(66);
+        // the stage's map, while this PC gets it from the host's (airnet)
+        if (s.mapState == an::MapState::Checking || s.mapState == an::MapState::Downloading || s.mapState == an::MapState::Failed) {
+            std::string line;
+            u32 ink = 0xB8B0C4;
+            if (s.mapState == an::MapState::Checking) {
+                line = "Looking for " + s.mapTitle + " on this PC...";
+            } else if (s.mapState == an::MapState::Downloading) {
+                line = "Downloading " + s.mapTitle + "  " + std::to_string(int(s.mapProgress * 100.f)) + "%";
+            } else {
+                line = "Could not get " + s.mapTitle + ": " + s.mapError, ink = kRed;
+            }
+            gameText(dl, g_font.text, U(15), ax0 + U(4), y + U(6), col(ink), fit(g_font.text, U(15), line, ax1 - ax0 - U(8)).c_str());
+            if (s.mapState == an::MapState::Downloading) {  // how far, as a bar (as the countdown's)
+                dl->AddRectFilled(ImVec2(ax0, y + U(18)), ImVec2(ax1, y + U(23)), col(0x4A4458), U(3));
+                dl->AddRectFilled(ImVec2(ax0, y + U(18)), ImVec2(ax0 + (ax1 - ax0) * clamp01(s.mapProgress), y + U(23)), col(kOrange), U(3));
+            }
+            y += U(30);
+        }
         if (L.session == an::SessionState::Results) {  // each player's report
             game::Json res = game::Json::parse(L.resultsJson);
             std::stable_sort(res.members.begin(), res.members.end(), [](const auto& x, const auto& y) {  // (by place, when they say)
@@ -1598,7 +1668,8 @@ void screenLobby(Frame& fr) {
         // The rows (the mode, then its rules) scroll within the panel: the focused row is kept in sight, the
         // mouse wheel scrolls, and arrows at the top / bottom show there is more.
         const std::vector<game::Rule>& rules = game::rules(st.mode);
-        const int n = 1 + int(rules.size());
+        const bool city = st.mode == game::kCityTrial;  // (City Trial: the Stage row after the mode)
+        const int rulesFrom = city ? 2 : 1, n = rulesFrom + int(rules.size());
         const float pitch = U(38), listTop = y, listBottom = b.y - U(8);
         const int fits = std::max(1, int((listBottom - listTop + U(6)) / pitch));
         const int first = nextIdx();
@@ -1612,8 +1683,33 @@ void screenLobby(Frame& fr) {
             if (s.lobby.maxPlayers > 4 && st.mode == game::kCityTrial) return toast("Matches of more than 4 are City Trial.");
             change(game::Settings::defaults(st.mode == game::kAirRide ? game::kCityTrial : game::kAirRide));
         }, shown(0));
-        for (int i = 1; i < n; i++) {
-            const game::Rule& r = rules[size_t(i - 1)];
+        if (city) {
+            // The stage: the city, or a map mod on the host's PC (the others get it from there: airnet). The host's
+            // choices are its map mods (looked through as the server opened); everyone sees the host's.
+            const std::string stage = st.stage.folder.empty() ? "Original" : st.stage.title.empty() ? st.stage.folder : st.stage.title;
+            settingRow(dl, ax0 + U(10), ax1, rowY(1), "Stage", stage, editable,
+                       editable ? "Where City Trial is played: the city, or a map mod on this PC (players without it get it from yours)."
+                                : "Where City Trial is played (players without the host's map get it from the host's PC).",
+                       [st, change](int d) {
+                           if (!g_maps.scanned) return toast("Looking for map mods on this PC...", false);
+                           const int count = 1 + int(g_maps.maps.size());
+                           if (count < 2) return toast("No map mods on this PC (mods/maps).", false);
+                           int cur = 0;
+                           for (size_t k = 0; k < g_maps.maps.size(); k++)
+                               if (!st.stage.folder.empty() && g_maps.maps[k].hash == st.stage.hash) cur = int(k) + 1;
+                           const int next = ((cur + d) % count + count) % count;
+                           game::Settings ns = st;
+                           ns.stage = game::Stage{};
+                           if (next) {
+                               const mapfiles::Map& m = g_maps.maps[size_t(next - 1)];
+                               ns.stage = {m.folder, m.title, m.hash, m.size};
+                           }
+                           change(ns);
+                       },
+                       shown(1));
+        }
+        for (int i = rulesFrom; i < n; i++) {
+            const game::Rule& r = rules[size_t(i - rulesFrom)];
             const int ci = st.index(r);
             settingRow(dl, ax0 + U(10), ax1, rowY(i), r.name.c_str(), r.names[size_t(ci)], editable, r.help.c_str(), [st, change, r, ci](int d) {
                 game::Settings ns = st;
@@ -2548,6 +2644,7 @@ void overlay(bool headless) {
             if (!s.error.empty()) toast(s.error);
             g.errorSerial = s.errorSerial;
         }
+        mapsFrame();
         watchMatch(now);
         if (g.open) syncScreen();
     }

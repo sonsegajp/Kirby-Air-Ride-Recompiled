@@ -156,6 +156,7 @@ lansession::Settings toSession(const Settings& st) {
         for (const Rule& r : rules(st.mode))
             if (r.id == in.key) ls.set(lansession::Setting(i), in.min + st.index(r));
     }
+    if (st.mode == kCityTrial && !st.stage.folder.empty()) ls.map = {st.stage.folder, st.stage.title, st.stage.hash, st.stage.size};
     return ls;
 }
 }  // namespace
@@ -176,6 +177,7 @@ Settings Settings::fromJson(const std::string& json) {
                 if (k >= 0 && k < int(r.ids.size())) st.values[r.id] = r.ids[size_t(k)];
             }
     }
+    if (st.mode == kCityTrial) st.stage = {ls.map.folder, ls.map.title, ls.map.hash, ls.map.size};
     return st;
 }
 // ---------------------------------------------------------------------------------------------------

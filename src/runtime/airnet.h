@@ -81,6 +81,16 @@ enum class Path : uint8_t {
 };
 const char* pathName(Path p);  // "-", "Relay", "Direct (LAN)", "Direct"
 
+// This PC's copy of the City Trial map the lobby's settings name (their "map": a map mod the host chose, which a
+// console without it downloads from the host's - docs/ONLINE.md, "Maps").
+enum class MapState : uint8_t {
+    None,         // no map named (the city)
+    Checking,     // looking for it among this PC's map mods
+    Downloading,  // from the host's console (Snapshot::mapProgress)
+    Ready,        // here (the master is told: a match waits for every player's)
+    Failed,       // could not get it (Snapshot::mapError); tried again by itself
+};
+
 // Profile choices: ids as the server stores them, with names to show.
 struct Choice {
     const char* id;
@@ -134,6 +144,7 @@ struct Member {
     bool away = false;       // connection dropped; their place is kept for a while
     int pingMs = -1;         // their round trip to the master
     int group = 0;           // (old: 1 if player, else 0)
+    std::string mapOk;       // the City Trial map they have (its hash; empty: none): a match on a map waits for its players'
 };
 
 struct Group {  // (old: match groups. The roster appears as group 1.)
@@ -225,6 +236,12 @@ struct Snapshot {
     Profile viewed;                   // from viewProfile()
     bool viewedValid = false;
 
+    // The lobby's City Trial map (its settings' "map"): whether this PC has it
+    MapState mapState = MapState::None;
+    float mapProgress = 0;            // Downloading: how far, 0..1
+    std::string mapTitle;             // its name, as the host has it
+    std::string mapError;             // Failed: why, for the player
+
     // Network (read live on every snapshot() call)
     bool linkUp = false;              // on the roster and connected: the game's LAN is "plugged in"
     bool relayTcp = false;            // the relay runs over TCP (UDP got no answer, or forced) - else UDP
@@ -253,6 +270,7 @@ namespace detail {
 void simulateConnectionLoss(Client& client);
 void setUdpGateway(Client& client, const std::string& hostPort);
 void setMacAddress(Client& client, const uint8_t mac[6]);
+void setMapsFolder(Client& client, const std::string& folder);
 }  // namespace detail
 
 // The online service this PC uses: the dedicated server the player chose in Online Settings
@@ -345,6 +363,7 @@ private:
     friend void detail::simulateConnectionLoss(Client&);
     friend void detail::setUdpGateway(Client&, const std::string&);
     friend void detail::setMacAddress(Client&, const uint8_t*);
+    friend void detail::setMapsFolder(Client&, const std::string&);
     std::unique_ptr<Impl> impl_;
 };
 
@@ -355,6 +374,16 @@ void shutdown();
 
 // ---- internals, exposed for tests ----
 namespace detail {
+// SHA-256 a piece at a time (also the maps' hashes: src/runtime/mapfiles.cpp).
+struct Sha256 {
+    uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    uint8_t buf[64];
+    size_t used = 0;
+    uint64_t total = 0;
+    void update(const void* data, size_t len);
+    void final(uint8_t out[32]);
+    void block(const uint8_t* p);
+};
 void sha256(const void* data, size_t len, uint8_t out[32]);
 void hmacSha256(const void* key, size_t keyLen, const void* data, size_t len, uint8_t out[32]);
 bool scrypt(const void* password, size_t passwordLen, const void* salt, size_t saltLen, uint64_t n,
@@ -364,6 +393,8 @@ bool scrypt(const void* password, size_t passwordLen, const void* salt, size_t s
 void setUdpGateway(Client& client, const std::string& hostPort);
 // (Tests) this client's console MAC (else rt::lan::macAddress()).
 void setMacAddress(Client& client, const uint8_t mac[6]);
+// (Tests) where this client's map mods are (else mods/maps: src/runtime/mapfiles.h).
+void setMapsFolder(Client& client, const std::string& folder);
 }  // namespace detail
 
 }  // namespace rt::airnet

@@ -212,7 +212,7 @@ class MasterServer:
             "peer_info": self.h_peer_info, "settings_set": self.h_settings_set,
             "session_start": self.h_session_start, "session_cancel": self.h_session_cancel,
             "session_continue": self.h_session_continue, "match_end": self.h_match_end,
-            "chat": self.h_chat,
+            "map_status": self.h_map_status, "chat": self.h_chat,
         }
         self.public = {"ping", "pong", "register", "login_begin", "login", "resume"}
 
@@ -652,6 +652,9 @@ class MasterServer:
             raise Fail("bad_request", "Settings are a JSON object.")
         if len(json.dumps(settings, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > P.SETTINGS_MAX:
             raise Fail("bad_request", "The settings are too large.")
+        m = settings.get("map")
+        if m is not None and (not isinstance(m, dict) or (m.get("folder") and not P.is_hex(m.get("hash"), P.MAP_HASH_HEX // 2))):
+            raise Fail("bad_request", "The map in the settings has no hash.")
         return settings
 
     async def h_host(self, s, msg):
@@ -808,6 +811,8 @@ class MasterServer:
             lobby.back_to_lobby()
         if len(lobby.roster()) < 2:
             raise Fail("not_enough_players", "A match needs at least 2 players.")
+        if not lobby.map_ready():
+            raise Fail("map_missing", "Not every player has the map yet.")
         now = time.monotonic()
         if msg.get("now"):
             lobby.begin_countdown(now, 0)
@@ -848,6 +853,19 @@ class MasterServer:
             lobby.end_match(time.monotonic(), RESULTS_TIME)
             log.info("#%d match %d over", lobby.lid, lobby.match_no)
         self._changed(lobby)
+        s.reply(msg)
+
+    async def h_map_status(self, s, msg):
+        """The City Trial map this member's console has (its hash; "": none). A match on a map starts only when
+        every player of it has that map."""
+        m = self._member(s)
+        ok = msg.get("map_ok", "")
+        if ok and not P.is_hex(ok, P.MAP_HASH_HEX // 2):
+            raise Fail("bad_request", "Invalid map hash.")
+        ok = ok.lower()
+        if ok != m.map_ok:
+            m.map_ok = ok
+            self._changed(m.lobby)
         s.reply(msg)
 
     async def h_peer_info(self, s, msg):
@@ -893,15 +911,15 @@ class MasterServer:
         return str(a)
 
     def _session(self, lobby):
-        """The session's automatic steps: countdown once 2+ are in, the match when it runs out,
-        results when a match is down to one player, the lobby again when results time is up."""
+        """The session's automatic steps: countdown once 2+ are in (and every player has the settings' map), the
+        match when it runs out, results when a match is down to one player, the lobby again when results time is up."""
         now = time.monotonic()
         for _ in range(4):  # one step may enable the next (results over -> countdown)
             players = len(lobby.roster())
             st = lobby.state
-            if st == LOBBY and lobby.auto_start and not lobby.hold and players >= 2:
+            if st == LOBBY and lobby.auto_start and not lobby.hold and players >= 2 and lobby.map_ready():
                 lobby.begin_countdown(now, COUNTDOWN_TIME)
-            elif st == COUNTDOWN and players < 2:
+            elif st == COUNTDOWN and (players < 2 or not lobby.map_ready()):
                 lobby.back_to_lobby()
             elif st == COUNTDOWN and now >= lobby.deadline:
                 self._start_match(lobby)

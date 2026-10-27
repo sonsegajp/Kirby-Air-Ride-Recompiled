@@ -51,9 +51,16 @@ const char* modeId(int mode);    // "air_ride", "city_trial"
 const char* modeName(int mode);  // "Air Ride", "City Trial"
 const std::vector<Rule>& rules(int mode);
 
+// City Trial's stage: a map mod in the city's place (src/runtime/mapfiles.h), named by its folder, found by its hash.
+struct Stage {
+    std::string folder, title, hash;  // folder "": the city
+    uint64_t size = 0;
+};
+
 struct Settings {
     int mode = kCityTrial;
     std::map<std::string, std::string> values;  // rule id -> choice id (missing: the rule's default)
+    Stage stage;                                // (City Trial)
     int index(const Rule& r) const;             // the choice in use
     void set(const Rule& r, int choice);
     std::string toJson() const;
