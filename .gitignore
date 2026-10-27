@@ -30,3 +30,6 @@ kirbyairride-settings.ini
 build_log.txt
 docs/HANDOFF.md
 disc.txt
+# The map tools' build output
+tools/mapeditor/*/bin/
+tools/mapeditor/*/obj/

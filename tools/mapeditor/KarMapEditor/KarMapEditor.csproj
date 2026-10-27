@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows7.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+    <AssemblyName>KarMapEditor</AssemblyName>
+    <RootNamespace>KarMapEditor</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\KarMapTool\KarMapTool.csproj" />
+    <ProjectReference Include="..\..\..\extern\HSDLib\HSDRaw\HSDRaw.csproj" />
+    <ProjectReference Include="..\..\..\extern\HSDLib\HSDRawViewer\HSDRawViewer.csproj" />
+    <Reference Include="IONET">
+      <HintPath>..\..\..\extern\HSDLib\HSDRawViewer\lib\IONET.dll</HintPath>
+    </Reference>
+    <Reference Include="OpenTK.WinForms">
+      <HintPath>..\..\..\extern\HSDLib\HSDRawViewer\lib\OpenTK.WinForms.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenTK" Version="4.7.4" />
+  </ItemGroup>
+
+</Project>

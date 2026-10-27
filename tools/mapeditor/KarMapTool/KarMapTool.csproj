@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows7.0</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\extern\HSDLib\HSDRaw\HSDRaw.csproj" />
+    <ProjectReference Include="..\..\..\extern\HSDLib\HSDRawViewer\HSDRawViewer.csproj" />
+    <Reference Include="IONET">
+      <HintPath>..\..\..\extern\HSDLib\HSDRawViewer\lib\IONET.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NLayer" Version="3.0.0" />
+    <PackageReference Include="NVorbis" Version="0.10.5" />
+    <PackageReference Include="VGAudio" Version="2.2.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="oot_entrances.txt" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>
