@@ -162,6 +162,12 @@ public class EditorForm : Form
             t.Tick += (_, _) =>
             {
                 t.Stop();
+                // (KARED_FOCUS=<area name>: the 3D view on that area first)
+                if (Environment.GetEnvironmentVariable("KARED_FOCUS") is string focus && _doc.Spec?.Areas.FirstOrDefault(a => a.Name == focus) is Area fa)
+                {
+                    _cam.Look(new Vector3(fa.X, fa.Y, fa.Z), Math.Max(fa.SizeX, fa.SizeZ) * 0.8f, 35, 30);
+                    _vp.Render();
+                }
                 using var gl = _vp.GenerateBitmap(_vp.Width, Math.Max(100, _vp.Height));
                 SixLabors.ImageSharp.ImageExtensions.SaveAsPng(gl, Path.ChangeExtension(shot, ".3d.png"));
                 using var bmp = new Bitmap(Width, Height);

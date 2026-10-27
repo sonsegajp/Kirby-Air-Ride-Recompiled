@@ -195,7 +195,8 @@ public static class MapBuilder
         // the fog: off, or as the map has it
         if (gd.FogNode?.FogData?.Fog is HSD_FogDesc fog)
         {
-            if (!spec.Fog.Enabled) { fog.Type = FogType.None; fog.Start = 1e6f; fog.End = 2e6f; log("fog: off"); }
+            // (off: the fog pushed out past the far plane, its kind kept - City Trial's fog event brings its own in from it)
+            if (!spec.Fog.Enabled) { fog.Start = 1e6f; fog.End = 2e6f; log("fog: off (out of sight)"); }
             else
             {
                 if (spec.Fog.Start is float fs) fog.Start = fs;
@@ -343,6 +344,7 @@ public static class MapBuilder
             foreach (var r in regions)
             {
                 var idx = mapIdx.Where(i => In(r, mids[i])).Select(i => (ushort)i).ToArray();
+                log($"  part {r.name}: {idx.Length} meshes, x {r.lo.X:F0}..{r.hi.X:F0} z {r.lo.Z:F0}..{r.hi.Z:F0}");
                 if (idx.Length == 0) continue;
                 // (where the camera can be while in it: the part's box, roomy)
                 vr.Add(new KAR_grViewRegion { MinX = r.lo.X - 500, MinY = r.lo.Y - 600, MinZ = r.lo.Z - 500, MaxX = r.hi.X + 500, MaxY = r.hi.Y + 2000, MaxZ = r.hi.Z + 500, Indices = idx });

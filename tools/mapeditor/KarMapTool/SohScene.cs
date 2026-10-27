@@ -86,7 +86,7 @@ class ResReader
     public string Str() { int n = S32(); var s = Encoding.ASCII.GetString(d, Pos, n); Pos += n; return s; }
 }
 
-public static class SohScene
+public static partial class SohScene
 {
     // One triangle as drawn: its corners (position, texture coordinate in texels of its texture, colour) and its material.
     record struct Corner(Vector3 P, Vector2 UV, Vector4 C);
@@ -198,6 +198,9 @@ public static class SohScene
         public Dictionary<Material, string> Combiners = new();
         public Matrix4x4 Xf = Matrix4x4.Identity;  // where what is drawn is placed (an actor's position and turn)
         public Dictionary<int, string> SegTextures;  // textures the scene's draw code puts in segments (by day)
+        // The scene's lights by day (its first light settings): what lit surfaces - their vertices normals, not colours - are
+        // shaded by: an ambient colour and two directional lights (each the way to the light).
+        public (Vector3 amb, Vector3 d1, Vector3 c1, Vector3 d2, Vector3 c2) Light = (new(0.6f), Vector3.Normalize(new(0.4f, 0.8f, 0.45f)), new(0.5f), -Vector3.Normalize(new(0.4f, 0.8f, 0.45f)), new(0.2f));
         readonly (Vector3 p, short s, short t, byte r, byte g, byte b, byte al)[] vbuf = new (Vector3, short, short, byte, byte, byte, byte)[64];
         uint geom = 0x00000400;  // (back faces culled, as the game sets scenes up to draw)
         uint otherH = 1u << 20, otherL;  // (two-cycle, as the game sets scenes up to draw)
@@ -213,6 +216,37 @@ public static class SohScene
         readonly int[] tileTmem = new int[8], tileFmt = new int[8], tilePal = new int[8], tileCms = new int[8], tileCmt = new int[8], tileShiftS = new int[8], tileShiftT = new int[8];
         readonly float[] tileUls = new float[8], tileUlt = new float[8];
         public int Missing;
+
+        // What the game's actors set before their lists (Gfx_SetupDL_25Opa/Xlu, z_rcp.c): texturing on, the combiner
+        // G_CC_MODULATEIDECALA then G_CC_MODULATEIA_PRIM2, two-cycle, lit, back faces culled - and the colours the
+        // actor's draw sets (white where it sets none).
+        public void Setup25(Vector4? primColor = null, Vector4? envColor = null)
+        {
+            texOn = true; texS = texT = 1; texTile = 0;
+            combine = 0x127E03UL << 32 | 0xFF0FF3FFUL;
+            otherH = 1u << 20; otherL = 0;
+            geom = 0x00000001 | 0x00000004 | 0x00000400 | 0x00010000 | 0x00020000 | 0x00200000;
+            prim = primColor ?? Vector4.One; primLod = 0.5f;
+            env = envColor ?? Vector4.One;
+        }
+
+        // The drawing state (what the actors' setup changes), kept to give back to the scenes' lists after them.
+        public (uint, uint, uint, ulong, Vector4, Vector4, float, float, float, int, bool) State
+        {
+            get => (geom, otherH, otherL, combine, prim, env, primLod, texS, texT, texTile, texOn);
+            set => (geom, otherH, otherL, combine, prim, env, primLod, texS, texT, texTile, texOn) = value;
+        }
+
+        // Vertices an actor's draw loads itself (gSPVertex from its code, a list then drawing them).
+        public void LoadVertices(string path, int n, int v0)
+        {
+            var vd = A.Read(path);
+            if (vd == null) { Missing++; return; }
+            int at = 8;
+            for (int i = 0; i < n && at + 16 <= vd.Length && v0 + i < vbuf.Length; i++, at += 16)
+                vbuf[v0 + i] = (Vector3.Transform(new Vector3(BitConverter.ToInt16(vd, at), BitConverter.ToInt16(vd, at + 2), BitConverter.ToInt16(vd, at + 4)), Xf),
+                                BitConverter.ToInt16(vd, at + 8), BitConverter.ToInt16(vd, at + 10), vd[at + 12], vd[at + 13], vd[at + 14], vd[at + 15]);
+        }
 
         public void Run(string path, int depth = 0)
         {
@@ -379,6 +413,16 @@ public static class SohScene
             return (tex, tlut);
         }
 
+        // a lit vertex's colour: its normal (the colour bytes, signed) turned as it is placed, under the scene's lights
+        Vector3 Lit(byte r, byte g, byte b)
+        {
+            var n = Vector3.TransformNormal(new Vector3((sbyte)r, (sbyte)g, (sbyte)b), Xf);
+            if (n.LengthSquared() < 1e-6f) return Light.amb;
+            n = Vector3.Normalize(n);
+            var c = Light.amb + Light.c1 * MathF.Max(0, Vector3.Dot(n, Light.d1)) + Light.c2 * MathF.Max(0, Vector3.Dot(n, Light.d2));
+            return Vector3.Min(c, Vector3.One);
+        }
+
         void Tri(int i0, int i1, int i2)
         {
             if (i0 >= vbuf.Length || i1 >= vbuf.Length || i2 >= vbuf.Length) return;
@@ -392,7 +436,7 @@ public static class SohScene
             for (int k = 0; k < 3; k++)
             {
                 var v = vbuf[idx[k]];
-                var shade = lit ? new Vector4(1, 1, 1, v.al / 255f) : new Vector4(v.r / 255f, v.g / 255f, v.b / 255f, v.al / 255f);
+                var shade = lit ? new Vector4(Lit(v.r, v.g, v.b), v.al / 255f) : new Vector4(v.r / 255f, v.g / 255f, v.b / 255f, v.al / 255f);
                 ks[k] = Combine(shade);
             }
             bool use0 = tex != null && ks.Any(q => Lum(q.k0) > 0.01f);
@@ -530,6 +574,29 @@ public static class SohScene
         ["spot20"] = new() { [8] = "scenes/shared/spot20_scene/gLonLonRanchDayWindowTex" },
     };
 
+    // A scene's light settings by day (its command 0x0F: a count, then 22 bytes each - ambient colour, light 1 direction and
+    // colour, light 2 direction and colour, fog colour, fog near/far): ambient and the two lights. A light with no direction
+    // (0, 0, 0: the sun's, set by the time of day) is the sun high in the sky, the other from below it.
+    static (Vector3 amb, Vector3 d1, Vector3 c1, Vector3 d2, Vector3 c2) SceneLight(byte[] d, (Vector3, Vector3, Vector3, Vector3, Vector3) fallback)
+    {
+        if (d == null) return fallback;
+        for (int at = 4; at + 8 + 22 <= d.Length; at++)
+        {
+            if (BitConverter.ToUInt32(d, at) != 0x0F) continue;
+            uint n = BitConverter.ToUInt32(d, at + 4);
+            if (n is 0 or > 32 || at + 8 + n * 22 > d.Length) continue;
+            int e = at + 8 + (n >= 4 ? 22 : 0);  // (outdoors, four by the time of day - dawn, day, dusk, night: the day's)
+            Vector3 Col(int o) => new Vector3(d[e + o], d[e + o + 1], d[e + o + 2]) / 255f;
+            Vector3 Dir(int o) => new((sbyte)d[e + o], (sbyte)d[e + o + 1], (sbyte)d[e + o + 2]);
+            var sun = Vector3.Normalize(new Vector3(0.4f, 0.8f, 0.45f));
+            var d1 = Dir(3); var d2 = Dir(9);
+            d1 = d1.LengthSquared() < 1 ? sun : Vector3.Normalize(d1);
+            d2 = d2.LengthSquared() < 1 ? -sun : Vector3.Normalize(d2);
+            return (Col(0), d1, Col(6), d2, Col(12));
+        }
+        return fallback;
+    }
+
     // Scenes drawn and collided into one model (each placed by its transform, in OoT units): the model (glTF), its
     // collision (OBJ), the main scene's first start position as the spawns, OoT's sky. Returns the map's description.
     public static Dictionary<string, object> ImportScenes(O2rArchive a, List<(string name, Matrix4x4 xf)> parts, string mainName, string outDir, float scale, Action<string> log)
@@ -539,6 +606,7 @@ public static class SohScene
         var rsp = new Rsp { A = a, Log = log };
         var actorColl = new List<(string path, Matrix4x4 xf)>();
         var collParts = new List<(string path, Matrix4x4 xf)>();
+        var scenery = new Scenery(a, rsp, actorColl, log);
         byte[] sceneData = null;
         foreach (var (partName, partXf) in parts)
         {
@@ -556,56 +624,17 @@ public static class SohScene
             rsp.Xf = partXf;
             rsp.SegTextures = SceneSegmentTextures.GetValueOrDefault(partName);
             rsp.Part = partName;
+            rsp.Light = SceneLight(a.Read($"{dir}/{partName}_scene"), rsp.Light);
             foreach (var l in lists) rsp.Run(l);
         }
-        // the scenery that is an actor in the game (the castle's drawbridge, its chains): drawn where the room puts it
-        foreach (var room in rooms)
-            foreach (var (id, pos, rot, prm) in RoomActors(a, room))
-            {
-                // Bg_Spot09_Obj, Gerudo Valley's: 0 the bridge's sides, 4 the bridge as the carpenters mend it (adult Link's:
-                // whole), 3 their tent - each its model and its collision (z_bg_spot09_obj.c: sDLists, D_808B1F90)
-                if (id == 0xB8)
-                {
-                    var parts9 = (prm & 0xFF) switch
-                    {
-                        0 => new[] { ("gValleyBridgeSidesDL", (string)null) },
-                        3 => new[] { ("gCarpentersTentDL", "gValleyObjects3Col"), ("gCarpentersTentEntranceDL", null) },
-                        4 => new[] { ("gValleyRepairedBridgeDL", "gValleyObjects4Col") },
-                        _ => null,
-                    };
-                    if (parts9 == null) continue;
-                    const string obj9 = "objects/object_spot09_obj/";
-                    var at9 = Place(pos, new Vector3(0, rot.Y, 0)) * partXf;
-                    rsp.Xf = at9;
-                    foreach (var (dl, col) in parts9)
-                    {
-                        rsp.Run(obj9 + dl);
-                        if (col != null) actorColl.Add((obj9 + col, at9));
-                    }
-                    log($"  Gerudo Valley's {(prm & 0xFF) switch { 0 => "bridge sides", 3 => "tent", _ => "bridge" }} at ({pos.X}, {pos.Y}, {pos.Z})");
-                    continue;
-                }
-                if (id != 0x4A || prm != 0xFFFF) continue;  // Bg_Spot00_Hanebasi, the drawbridge itself (-1; down, as by day)
-                const string obj = "objects/object_spot00_objects/";
-                var bridge = Place(pos, new Vector3(0, rot.Y, 0)) * partXf;
-                rsp.Xf = bridge;
-                rsp.Run(obj + "gHyruleFieldCastleDrawbridgeDL");
-                actorColl.Add((obj + "gHyruleFieldCastleDrawbridgeCol", bridge));
-                // its chains, at the bridge's corners (as its draw puts them), turned as it is
-                foreach (float side in new[] { 158f, -158f })
-                {
-                    var at = Vector3.Transform(new Vector3(side, 10, 400), bridge);
-                    var chain = Place(at, new Vector3(0, rot.Y, 0));
-                    rsp.Xf = chain;
-                    rsp.Run(obj + "gHyruleFieldCastleDrawbridgeChainsDL");
-                    actorColl.Add((obj + "gHyruleFieldCastleDrawbridgeChainsCol", chain));
-                }
-                log($"  the drawbridge at ({pos.X}, {pos.Y}, {pos.Z})");
-            }
+        // the scenery that is an actor in the game (trees, bushes, rocks, signs, fences, the castle's drawbridge...): each
+        // drawn where its room puts it, as its draw does (SohActors.cs)
+        scenery.PlaceAll(partName, dir, rooms, partXf);
         rsp.Xf = Matrix4x4.Identity;
         }
+        scenery.Report();
         if (rsp.Missing > 0) log($"  ({rsp.Missing} references not found)");
-        log($"{rsp.Tris.Count} triangles, {rsp.Materials.Count} materials");
+        log($"{rsp.Tris.Count} triangles ({scenery.Triangles} of them the actors'), {rsp.Materials.Count} materials");
         foreach (var (m, name) in rsp.Materials.Take(60)) log($"  {name}: {m.Tex?[(m.Tex.LastIndexOf('/') + 1)..]} {m.Tlut?[(m.Tlut.LastIndexOf('/') + 1)..]} cm {m.Cms}/{m.Cmt} alpha {m.TexAlpha} x{rsp.Tris.Count(t => t.m == m)} {rsp.Combiners.GetValueOrDefault(m)}");
         log("  commands: " + string.Join(" ", rsp.Ops.OrderBy(o => o.Key).Select(o => $"{o.Key:X2}:{o.Value}")));
 
@@ -670,7 +699,9 @@ public static class SohScene
                 for (int i = 0; i < nv; i++) verts[i] = Vector3.Transform(new Vector3(r.S16(), r.S16(), r.S16()), xf) * scale;
                 int np = (int)r.U32();
                 foreach (var v in verts) sb.Append($"v {v.X:R} {v.Y:R} {v.Z:R}\n");
-                var nxf = Matrix4x4.CreateFromQuaternion(Quaternion.CreateFromRotationMatrix(xf));
+                // (the turn alone: an actor's placement can be scaled)
+                Matrix4x4.Decompose(xf, out _, out var turn, out _);
+                var nxf = Matrix4x4.CreateFromQuaternion(turn);
                 for (int i = 0; i < np; i++)
                 {
                     r.U16();
@@ -687,10 +718,20 @@ public static class SohScene
                 nvAll += nv;
             }
             foreach (var (path, xf) in collParts) Add(path, xf);
+            int sceneKept = kept;
             foreach (var (path, xf) in actorColl) if (a.Has(path)) Add(path, xf);
+            int actorKept = kept - sceneKept;
+            // the solids round trees, boulders, signs and the like (each already wound outward)
+            foreach (var (p0, p1, p2) in scenery.Solids)
+            {
+                foreach (var v in new[] { p0 * scale, p1 * scale, p2 * scale }) sb.Append($"v {v.X:R} {v.Y:R} {v.Z:R}\n");
+                sb.Append($"f {nvAll + 1} {nvAll + 2} {nvAll + 3}\n");
+                nvAll += 3;
+                kept++;
+            }
             collFile = $"{sceneName}_collision.obj";
             File.WriteAllText(Path.Combine(outDir, collFile), sb.ToString());
-            log($"collision: {nvAll} vertices, {kept} triangles");
+            log($"collision: {nvAll} vertices, {kept} triangles (the scenes' {sceneKept}, actors' own {actorKept}, solids round scenery {scenery.Solids.Count})");
         }
 
         // ---- the riders' spawns: the scene's first start position, the four side by side ----

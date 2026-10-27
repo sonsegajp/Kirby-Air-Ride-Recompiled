@@ -118,6 +118,9 @@ public static class SohWorld
         return s;
     }
 
+    // (how far apart the places are set, OoT units: each drawn only from inside it, and none in sight of another)
+    const float Apart = 24000;
+
     public static void Import(string o2r, string mainName, string outDir, float scale, Action<string> log)
     {
         using var a = new O2rArchive(o2r);
@@ -152,12 +155,12 @@ public static class SohWorld
                 dir = dir.LengthSquared() > 1 ? Vector3.Normalize(dir) : Vector3.UnitX;
                 var half = (s.Hi - s.Lo) / 2;
                 var sMid = (s.Lo + s.Hi) / 2;
-                float reach = (new Vector2(fHi.X - fLo.X, fHi.Z - fLo.Z).Length() + new Vector2(half.X, half.Z).Length() * 2) / 2 + 400;
-                for (int tries = 0; tries < 200; tries++, reach += 600)
+                float reach = (new Vector2(fHi.X - fLo.X, fHi.Z - fLo.Z).Length() + new Vector2(half.X, half.Z).Length() * 2) / 2 + Apart;
+                for (int tries = 0; tries < 200; tries++, reach += 2000)
                 {
                     var c = mid + dir * reach;
                     s.Offset = new Vector3(c.X - sMid.X, main.Lo.Y - s.Hi.Y - 3000, c.Z - sMid.Z);
-                    bool overlaps = scenes.Any(o => Overlap(o.Lo + o.Offset, o.Hi + o.Offset, s.Lo + s.Offset, s.Hi + s.Offset, 1500));
+                    bool overlaps = scenes.Any(o => Overlap(o.Lo + o.Offset, o.Hi + o.Offset, s.Lo + s.Offset, s.Hi + s.Offset, Apart));
                     if (!overlaps) break;
                 }
                 scenes.Add(s);
