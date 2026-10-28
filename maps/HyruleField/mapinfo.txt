@@ -1,6 +1,7 @@
 # A custom map's areas and warps (KarMapTool): world units (the stage file's x its scale).
 # area <name> <centre x y z> <half size x y z> <yaw> <track>
 # warp <name> <centre x y z> <half size x y z> <yaw> <to x y z> <to yaw>
+fog off
 area spot00 -1110.293 -31.063 10011.6 1590.75 370.563 1634.85 0 -
 area spot01 4198.421 -938.525 3753.166 659.838 431.9 403.025 0 2d_desert
 area spot03 9937.162 -865.375 5199.434 671.3 358.75 368.638 0 -

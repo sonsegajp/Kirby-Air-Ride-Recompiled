@@ -27,6 +27,14 @@ Playing
 Controls: a gamepad, or the keyboard: WASD stick, Space A, Left Shift B, F X, C Y, Tab Z, Q/E L/R, Enter START,
 arrow keys D-pad, IJKL C-stick. F1 opens the menu (graphics, audio, online settings).
 
+City Trial maps
+---------------
+Custom City Trial maps are mods: each in its own folder in mods\maps (the Hyrule Field download unzips there).
+Choose one in City Trial's Game Settings, "Stage". Online, the host's map is sent to everyone in the lobby.
+The map editor (its own download: unzip it into this folder) makes them from a 3D model (.gltf .glb .obj .fbx
+.dae .smd): spawns, areas with their music and minimap, warps, event points, fog and sky; Build makes the mod,
+Play starts the game on it. It reads the city's files it needs from your disc through the game.
+
 The disc
 --------
 The recompiler is made for the USA release's program: main.dol, 5,514,016 bytes,

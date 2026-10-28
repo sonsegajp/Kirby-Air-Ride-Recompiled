@@ -24,6 +24,7 @@ public static class MapExtras
         string F(float v) => v.ToString("0.###", inv);
         var info = new StringBuilder("# A custom map's areas and warps (KarMapTool): world units (the stage file's x its scale).\n");
         info.Append($"# area <name> <centre x y z> <half size x y z> <yaw> <track>\n# warp <name> <centre x y z> <half size x y z> <yaw> <to x y z> <to yaw>\n");
+        if (!spec.Fog.Enabled) info.Append("fog off\n");  // (the game draws no fog but the Fog event's)
         var audio = Path.Combine(outDir, "audio", "jp");
 
         // ---- music ----

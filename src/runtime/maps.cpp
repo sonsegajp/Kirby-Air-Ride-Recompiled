@@ -41,6 +41,9 @@ constexpr u32 kCityGimmicks = 0x8010F268;
 // The stage's marker joints ("null positions": grnullpos.c), matched by name to joints of the city's model as the stage
 // loads; it answers the first one missing (-1: none), and a missing one stops the game. A custom map's model has none.
 constexpr u32 kNullPosMatch = 0x800E3CB8;
+constexpr u32 kAssert = 0x804284B8;  // __assert(file, line, expression)
+constexpr u32 kGXSetFog = 0x803CF33C;
+constexpr u32 kMtxPerspective = 0x803D1F30;
 // The city's setup for the mode played (City Trial, the Stadiums...): shows the city's parts that mode uses - joints of the
 // city's model, by numbers in the stage's parameters, each with its collision - after animating the city's parts
 // (800DBE48) and before its end (800DC1B4). A custom map: the end alone.
@@ -85,8 +88,12 @@ struct Pending {
 int s_inArea = -1;       // the area the first rider is in (-1: none): its music plays
 int s_riderArea = -1;    // ... any area, music or not (-1: none): what lies in the others is not drawn
 
+bool s_fogOff = false;   // the map's fog off ("fog off" in mapinfo.txt): none drawn but the Fog event's
+float s_skyFar = 0;      // how far the camera must see: across the biggest part's sky (0: as the game has it)
+
 void loadMapInfo(const std::string& dir) {
     s_areas.clear(), s_warps.clear();
+    s_fogOff = false;
     std::FILE* f = std::fopen((dir + "/mapinfo.txt").c_str(), "r");
     if (!f) return;
     char line[512];
@@ -95,7 +102,8 @@ void loadMapInfo(const std::string& dir) {
         float v[11];
         if (line[0] == '#') continue;
         if (std::sscanf(line, "%15s", kind) != 1) continue;
-        if (!std::strcmp(kind, "area") &&
+        if (!std::strcmp(kind, "fog") && std::strstr(line, "off")) s_fogOff = true;
+        else if (!std::strcmp(kind, "area") &&
             std::sscanf(line, "%*s %127s %f %f %f %f %f %f %f %63s", name, &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], track) == 9) {
             AreaInfo a;
             a.name = name, a.track = track;
@@ -113,7 +121,12 @@ void loadMapInfo(const std::string& dir) {
         }
     }
     std::fclose(f);
-    log("[maps] map info: %zu areas, %zu warps\n", s_areas.size(), s_warps.size());
+    // (each part's sky stands round it - the map builder's sizes, world units: at least the city's, 2800 x 0.7 - so the
+    // camera must see across the biggest)
+    s_skyFar = 0;
+    for (const AreaInfo& a : s_areas)
+        s_skyFar = std::max(s_skyFar, 2.f * std::max(1960.f, 1.15f * std::sqrt(a.h[0] * a.h[0] + a.h[2] * a.h[2])) + 1000.f);
+    log("[maps] map info: %zu areas, %zu warps%s\n", s_areas.size(), s_warps.size(), s_fogOff ? ", fog off" : "");
 }
 
 // ---- an area's music: played as City Trial's events play theirs (grEventGenerator: announce 800EE778, start
@@ -762,13 +775,55 @@ void mapsInit() {
             }
             interpOriginal(c, entry);
         });
+    // A collision search's boxes past its list's 200 (lbkdcoll.c line 154, from 80071610..80071704): a custom map's places
+    // lie far apart, and the camera's first search after a warp sweeps from the old place to the new one - over every box
+    // between. The list stays at 200 for that frame; the search goes on (the code after the assert's call carries on).
+    // The map's fog off: GXSetFog(type, start, end, near, far, colour) given no fog - but for the Fog event's (the thick one,
+    // ending within 150 units; the city's usual ends at 665). The stage's skies keep their fogs in the file: the sky is
+    // sized by them.
+    if (rd32(kGXSetFog) == 0x7C0802A6)  // (mflr r0)
+        interpReplace(0, kGXSetFog, [](Ctx& c, u32 entry) {
+            if (g_customCity.load() && s_fogOff && c.f[2] > 150.0) c.r[3] = 0;  // GX_FOG_NONE
+            interpOriginal(c, entry);
+        });
+    // C_MTXPerspective(m, fovy, aspect, near, far): the camera sees across its part's sky (a map's parts each have one)
+    if (rd32(kMtxPerspective) == 0x7C0802A6)  // (mflr r0)
+        interpReplace(0, kMtxPerspective, [](Ctx& c, u32 entry) {
+            if (g_customCity.load() && s_skyFar > 0 && c.f[4] > 1000.0 && c.f[4] < s_skyFar) {
+                static bool once;
+                if (!once) once = true, log("[maps] the camera's far plane: %.0f -> %.0f (the parts' skies)\n", c.f[4], s_skyFar);
+                c.f[4] = s_skyFar;
+            }
+            interpOriginal(c, entry);
+        });
+    if (rd32(kAssert) == 0x9421FFF0)  // (stwu r1,-16(r1))
+        interpReplace(0, kAssert, [](Ctx& c, u32 entry) {
+            if (g_customCity.load() && c.r[4] == 154 && guestPtr(c.r[3])) {
+                static const char kFile[] = "lbkdcoll.c";
+                bool same = true;
+                for (u32 i = 0; i < sizeof kFile && same; i++) same = rd8(c.r[3] + i) == u8(kFile[i]);
+                if (same) {
+                    static bool once;
+                    if (!once) once = true, log("[maps] a collision search past its 200 boxes (after a long warp): cut short\n");
+                    return;
+                }
+            }
+            interpOriginal(c, entry);
+        });
     if (rd32(kNullPosMatch) == 0x9421FFA0)  // (stwu r1,-96(r1))
         interpReplace(0, kNullPosMatch, [](Ctx& c, u32 entry) {
             if (g_customCity.load() && skipping("nullpos")) {
                 c.r[3] = 0xFFFFFFFFu;  // (none missing)
                 return;
             }
+            const u32 out = c.r[3], list = c.r[4];
             interpOriginal(c, entry);
+            if (g_customCity.load() && c.r[3] != 0xFFFFFFFFu && guestPtr(out) && guestPtr(rd32(out)) && guestPtr(list)) {
+                // (a start position with no floor below: where it is, for the map's maker)
+                const u32 e = rd32(out) + c.r[3] * 0x24;
+                log("[maps] start position %d of %u has no floor below it: at %.0f %.0f %.0f\n", s32(c.r[3]), rd32(list + 8), flt(rd32(e)),
+                    flt(rd32(e + 4)), flt(rd32(e + 8)));
+            }
         });
     if (std::getenv("SA2_MAP_CAMLOG"))  // (debugging a custom map: the camera's parameters as each frame sets them)
         interpReplace(0, 0x800B31D4, [](Ctx& c, u32 entry) {

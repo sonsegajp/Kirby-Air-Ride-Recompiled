@@ -4,12 +4,138 @@ using HSDRaw;
 using HSDRaw.AirRide.Gr;
 using HSDRaw.AirRide.Gr.Data;
 using HSDRaw.Common;
+using HSDRaw.GX;
 
 static class Program
 {
     static int Main(string[] args)
     {
         if (args.Length >= 2 && args[0] == "dump") return Dump(args[1]);
+        if (args.Length >= 3 && args[0] == "city")  // city <disc dir> <out dir>: the original city as a map (its model as glTF, its spawns and events' points), for the editor
+        {
+            string disc = args[1], outDir = args[2];
+            Directory.CreateDirectory(outDir);
+            var gm = new HSDRawFile(Path.Combine(disc, "GrCity1Model.dat")).Roots.Select(r => r.Data).OfType<KAR_grModel>().First();
+            var model = Path.Combine(outDir, "city.gltf");
+            // (the textures as the game lays them: repeated and moved as each one's settings say; placed in the world)
+            var es = new HSDRawViewer.Converters.ModelExportSettings { Directory = Path.GetFullPath(outDir) + "\\", ExportScaledUVs = true, ExportTransformedUVs = true };
+            var exp = new HSDRawViewer.Converters.ModelExporter(gm.MainModel.RootNode, es, new HSDRawViewer.Tools.Animation.JointMap());
+            var scene = exp.Scene;
+            var matColour = new Dictionary<string, System.Numerics.Vector4>();
+            foreach (var (m, mobj) in exp.MaterialToMObj)
+            {
+                // a material whose texture isn't marked as its colour: its first one
+                if (m.DiffuseMap == null && mobj?.Textures?.List.FirstOrDefault(t => t.ImageData?.ImageData != null) is { } t0)
+                {
+                    var name = $"tex_{HSDRawViewer.Extensions.ImporterExtensions.ComputeHash(t0.ImageData.ImageData):X8}.png";
+                    if (!File.Exists(Path.Combine(outDir, name))) HSDRawViewer.TOBJExtentions.SaveImagePNG(t0, Path.Combine(outDir, name));
+                    m.DiffuseMap = new IONET.Core.Model.IOTexture { Name = name, FilePath = name, WrapS = t0.WrapS == HSDRaw.GX.GXWrapMode.CLAMP ? IONET.Core.Model.WrapMode.CLAMP : t0.WrapS == HSDRaw.GX.GXWrapMode.MIRROR ? IONET.Core.Model.WrapMode.MIRROR : IONET.Core.Model.WrapMode.REPEAT, WrapT = t0.WrapT == HSDRaw.GX.GXWrapMode.CLAMP ? IONET.Core.Model.WrapMode.CLAMP : t0.WrapT == HSDRaw.GX.GXWrapMode.MIRROR ? IONET.Core.Model.WrapMode.MIRROR : IONET.Core.Model.WrapMode.REPEAT };
+                }
+                var c = mobj?.Material?.DiffuseColor ?? System.Drawing.Color.White;
+                matColour[m.Name] = new System.Numerics.Vector4(c.R / 255f, c.G / 255f, c.B / 255f, c.A / 255f);
+            }
+            var uvSet = scene.Materials.ToDictionary(m => m.Name, m => m.DiffuseMap?.UVChannel ?? 0);
+            var done = new HashSet<IONET.Core.Model.IOVertex>();
+            foreach (var mesh in scene.Models[0].Meshes)
+                foreach (var poly in mesh.Polygons)
+                {
+                    int set = poly.MaterialName != null && uvSet.TryGetValue(poly.MaterialName, out int s) ? s : 0;
+                    var mc = poly.MaterialName != null && matColour.TryGetValue(poly.MaterialName, out var col) ? col : System.Numerics.Vector4.One;
+                    foreach (int i in poly.Indicies)
+                    {
+                        var v = mesh.Vertices[i];
+                        if (!done.Add(v)) continue;
+                        // the texture's own UV set first, in glTF's way up (the writer turns V over again)
+                        if (set > 0 && set < v.UVs.Count) (v.UVs[0], v.UVs[set]) = (v.UVs[set], v.UVs[0]);
+                        if (v.UVs.Count > 0) v.UVs[0] = new System.Numerics.Vector2(v.UVs[0].X, 1 - v.UVs[0].Y);
+                        if (v.Colors.Count == 0) v.Colors.Add(mc);
+                    }
+                }
+            GltfIO.Write(scene, model);
+            var gd = (KAR_grData)new HSDRawFile(Path.Combine(disc, "GrCity1.dat")).Roots[0].Data;
+            float Yaw(KAR_grPositionData p) => MathF.Atan2(-p.FX, -p.FZ) * 180f / MathF.PI;
+            var spec = new MapSpec { Name = "City Trial (original)", Model = model, Center = false };
+            var sp = gd.PositionNode.Startpos?.Array;
+            if (sp is { Length: > 0 } && sp[0].PositionData?.Array is { } spd)
+                foreach (var p in spd) spec.Spawns.Add(new Placed { X = p.X, Y = p.Y, Z = p.Z, Yaw = Yaw(p) });
+            var evFile = Path.Combine(disc, "GrCity1Event.dat");
+            var evPts = gd.PositionNode.Eventpos?.Array is { Length: > 0 } el ? el[0].PositionData?.Array : null;
+            if (File.Exists(evFile) && evPts != null)
+            {
+                var evRoot = new HSDRawFile(evFile).Roots.First(r => r.Name == "grEventDataAllCity1");
+                var ps = new KAR_grEventDataAllCity1 { _s = evRoot.Data._s }.EventNode.EventParams.Array;
+                foreach (EventKind k in Enum.GetValues<EventKind>())
+                {
+                    if ((int)k >= ps.Length) continue;
+                    for (int i = ps[(int)k].PositionStart; i < ps[(int)k].PositionStart + ps[(int)k].PositionNum && i < evPts.Length; i++)
+                        spec.EventPoints.Add(new EventPoint { X = evPts[i].X, Y = evPts[i].Y, Z = evPts[i].Z, Yaw = Yaw(evPts[i]), Event = k });
+                }
+            }
+            spec.Model = "city.gltf";
+            File.WriteAllText(Path.Combine(outDir, "map.json"), System.Text.Json.JsonSerializer.Serialize(spec, new System.Text.Json.JsonSerializerOptions { WriteIndented = true, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull }));
+            Console.WriteLine($"{model}: {spec.Spawns.Count} spawns, {spec.EventPoints.Count} event points");
+            return 0;
+        }
+        if (args.Length >= 2 && args[0] == "xlu")  // (the see-through meshes: their materials and vertex attributes)
+        {
+            var gm = new HSDRawFile(args[1]).Roots.Select(r => r.Data).OfType<KAR_grModel>().First();
+            int n = 0;
+            foreach (var j in gm.MainModel.RootNode.TreeList)
+                for (var d = j.Dobj; d != null; d = d.Next)
+                {
+                    if (d.Mobj == null || d.Pobj == null || (d.Mobj.RenderFlags & RENDER_MODE.XLU) == 0) continue;
+                    var v0 = d.Pobj.ToDisplayList().Vertices; if (v0.Count == 0 || v0.Average(v => v.CLR0.G - v.CLR0.R) < 0.1f || n++ > 6) continue;
+                    var attrs = d.Pobj == null ? "" : string.Join(",", d.Pobj.ToGXAttributes().Select(a => a.AttributeName));
+                    var t = d.Mobj.Textures;
+                    var clr = d.Pobj?.ToDisplayList().Vertices.Take(3).Select(v => $"({v.CLR0.R:F2},{v.CLR0.G:F2},{v.CLR0.B:F2},{v.CLR0.A:F2})");
+                    Console.WriteLine($"{d.Mobj.RenderFlags} mat {d.Mobj.Material?.DiffuseColor} tex {t?.Flags} {t?.ImageData?.Format} pe {d.Mobj.PEDesc != null} attrs {attrs} clr {string.Join(" ", clr ?? Array.Empty<string>())} joint {j.Flags}");
+                }
+            return 0;
+        }
+        if (args.Length >= 2 && args[0] == "regions")  // (the main model's culling: each view region's box and meshes)
+        {
+            var gm = new HSDRawFile(args[1]).Roots.Select(r => r.Data).OfType<KAR_grModel>().First();
+            var b = gm.MainModel.ModelBounding;
+            int k = 0;
+            foreach (var r in b.ViewRegions ?? Array.Empty<KAR_grViewRegion>())
+                if (k++ < 3) Console.WriteLine($"region: x {r.MinX:F0}..{r.MaxX:F0} z {r.MinZ:F0}..{r.MaxZ:F0}: {r.Indices.Length} meshes, {string.Join(",", r.Indices.Take(6))}..{string.Join(",", r.Indices.TakeLast(4))}");
+            Console.WriteLine($"always: {b.Indices.Length}; boxes {b.StaticBoundingBoxes.Length}; joints {gm.MainModel.JobjCount} meshes {gm.MainModel.DobjCount}");
+            int n = 0;
+            foreach (var j in gm.MainModel.RootNode.TreeList) { for (var d = j.Dobj; d != null; d = d.Next) n++; }
+            Console.WriteLine($"tree meshes {n}; root's children: {gm.MainModel.RootNode.Children.Length}");
+            return 0;
+        }
+        if (args.Length >= 2 && args[0] == "vtxflags")  // (the model's meshes: render flags, by whether their vertices have colours)
+        {
+            var gm = new HSDRawFile(args[1]).Roots.Select(r => r.Data).OfType<KAR_grModel>().First();
+            var counts = new Dictionary<string, int>();
+            foreach (var j in gm.MainModel.RootNode.TreeList)
+                for (var d = j.Dobj; d != null; d = d.Next)
+                {
+                    if (d.Pobj == null || d.Mobj == null) continue;
+                    bool clr = d.Pobj.ToGXAttributes().Any(a => a.AttributeName == GXAttribName.GX_VA_CLR0);
+                    var k = $"clr0={clr} {d.Mobj.RenderFlags} tev={(d.Mobj.Textures?.TEV != null)} pe={(d.Mobj.PEDesc != null)} mat={d.Mobj.Material?.DiffuseColor.Name} amb={d.Mobj.Material?.AmbientColor.Name}";
+                    counts[k] = counts.GetValueOrDefault(k) + 1;
+                }
+            foreach (var (k, n) in counts.OrderByDescending(x => x.Value).Take(15)) Console.WriteLine($"{n,5} {k}");
+            return 0;
+        }
+        if (args.Length >= 2 && args[0] == "fog")  // (the stage's fog: its kind, start, end and colour)
+        {
+            var gd = (KAR_grData)new HSDRawFile(args[1]).Roots[0].Data;
+            var fn = gd.FogNode;
+            Console.WriteLine($"fog node: {fn?._s.Length} bytes");
+            if (fn?.FogData?.Fog is HSD_FogDesc f) Console.WriteLine($"fog: type {f.Type} start {f.Start} end {f.End} colour {f.Color}");
+            if (fn?.FogTypes?.FogData?.Array is { } types)
+                for (int i = 0; i < types.Length; i++)
+                {
+                    var s = types[i]._s;
+                    Console.Write($"  type {i}:");
+                    for (int o = 0; o < s.Length; o += 4) Console.Write(o is 0 or 4 or 0x10 or 0x14 or 0x20 or 0x24 ? $" {o:X2}:{s.GetInt32(o):X8}" : $" {o:X2}:{s.GetFloat(o):G5}");
+                    Console.WriteLine();
+                }
+            return 0;
+        }
         if (args.Length >= 2 && args[0] == "events")  // (City Trial's events: each one's points in the stage's event list)
         {
             var ev = new HSDRawFile(args[1]).Roots[0].Data;
@@ -64,6 +190,7 @@ static class Program
                         foreach (var dl in p.ToDisplayList().Vertices)
                         { var v = new System.Numerics.Vector3(dl.POS.X, dl.POS.Y, dl.POS.Z); lo = System.Numerics.Vector3.Min(lo, v); hi = System.Numerics.Vector3.Max(hi, v); }
                     Console.WriteLine($"  mesh {n}: render {m?.RenderFlags} bounds {lo}..{hi}");
+                    if (m?.PEDesc is { } pe) Console.WriteLine($"    pe: flags {pe.Flags} blend {pe.BlendMode} {pe.SrcFactor}/{pe.DstFactor} depth {pe.DepthFunction} alpha {pe.AlphaComp0} {pe.AlphaRef0}");
                     var vs = d.Pobj?.ToDisplayList().Vertices;
                     if (vs != null) foreach (var v in vs.Where((_, i) => i % Math.Max(1, vs.Count / 6) == 0).Take(7)) Console.WriteLine($"      ({v.POS.X:F0},{v.POS.Y:F0},{v.POS.Z:F0}) uv ({v.TEX0.X:F3},{v.TEX0.Y:F3})");
                     for (var t = m?.Textures; t != null; t = t.Next)

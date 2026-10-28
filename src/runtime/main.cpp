@@ -111,6 +111,38 @@ std::string rememberedDisc() {
 }
 void rememberDisc(const std::string& path) { std::ofstream(exeDir() / "disc.txt") << path << "\n"; }
 
+// --extract <dir> <file>...: files of the disc (any directory, by name) copied into dir - the map editor's stage files
+// (GrCity1.dat...), from whatever image the game reads. 0: all there.
+int extractFiles(const std::string& iso, const std::string& dir, const std::vector<std::string>& names) {
+    std::string err;
+    const auto img = iso.empty() ? nullptr : disc::open(std::filesystem::u8path(iso), err);
+    if (!img) return std::fprintf(stderr, "no disc image: %s\n", iso.empty() ? "none chosen" : err.c_str()), 1;
+    auto be = [](const u8* p) { return u32(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; };
+    u8 h[8];
+    if (!img->read(0x424, h, 8)) return std::fprintf(stderr, "can't read the disc's header\n"), 1;
+    std::vector<u8> fst(be(h + 4));
+    if (fst.size() < 12 || !img->read(be(h), fst.data(), fst.size())) return std::fprintf(stderr, "can't read the disc's file table\n"), 1;
+    const u32 count = be(fst.data() + 8);
+    if (u64(count) * 12 > fst.size()) return std::fprintf(stderr, "bad file table\n"), 1;
+    const char* strings = reinterpret_cast<const char*>(fst.data() + count * 12);
+    std::filesystem::create_directories(std::filesystem::u8path(dir));
+    int missing = 0;
+    for (const std::string& want : names) {
+        bool found = false;
+        for (u32 i = 1; i < count && !found; i++) {
+            const u8* e = fst.data() + i * 12;
+            const u32 nameAt = be(e) & 0xFFFFFF;
+            if (e[0] != 0 || count * 12 + nameAt >= fst.size() || _stricmp(strings + nameAt, want.c_str())) continue;
+            std::vector<u8> data(be(e + 8));
+            if (!img->read(be(e + 4), data.data(), data.size())) break;
+            std::ofstream(std::filesystem::u8path(dir) / want, std::ios::binary).write(reinterpret_cast<const char*>(data.data()), data.size());
+            found = true;
+        }
+        if (!found) std::fprintf(stderr, "%s: not on the disc\n", want.c_str()), missing++;
+    }
+    return missing ? 1 : 0;
+}
+
 // Everything that needs the game's code, once it is there: guest memory, the program, the disc.
 bool bootGame(std::string& error) {
     if (!loadGameModule(s_eightRiders, error)) return false;
@@ -179,6 +211,8 @@ int main(int argc, char** argv) {
     bool headless = false, mute = std::getenv("SA2_MUTE") != nullptr;
     u64 maxFrames = 0;
     float volume = std::getenv("SA2_VOLUME") ? float(std::atof(std::getenv("SA2_VOLUME"))) / 100.f : 1.f;  // percent
+    std::string extractDir;
+    std::vector<std::string> extractNames;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--dol" && i + 1 < argc) s_dolPath = argv[++i];
@@ -191,9 +225,14 @@ int main(int argc, char** argv) {
         else if (a == "--fast-disc") _putenv("SA2_FAST_DISC=1");  // read by the drive model (hle_dvd.cpp)
         else if (a == "--frames" && i + 1 < argc) maxFrames = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--8p") s_eightRiders = true;  // the 8-rider build (kirbyairride_game_8p.dll)
+        else if (a == "--extract" && i + 1 < argc) {  // --extract <dir> <file>...: files of the disc copied out (the map editor's stage files)
+            extractDir = argv[++i];
+            while (i + 1 < argc && argv[i + 1][0] != '-') extractNames.push_back(argv[++i]);
+        }
         else if (a == "--window" || a == "--hd-textures") i++;  // (the frontend's, with a value)
         else if (a[0] != '-' && s_isoPath.empty()) s_isoPath = a;  // a disc image dropped on the program
     }
+    if (!extractDir.empty()) return extractFiles(s_isoPath.empty() ? rememberedDisc() : s_isoPath, extractDir, extractNames);
     // Played sessions keep their log (kirbyairride.log, replaced at each start); test runs (headless) capture
     // the console instead and leave it alone.
     if (!headless) logToFile("kirbyairride.log");

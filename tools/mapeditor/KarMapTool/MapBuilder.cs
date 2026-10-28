@@ -205,6 +205,9 @@ public static class MapBuilder
                 log($"fog: {fog.Start:F0} to {fog.End:F0}");
             }
         }
+        // (The skies' own fogs - FogTypes, one per sky: the stage changes to one when an event changes the sky, and back to the
+        // city's usual, 210 to 665, after - stay: the sky is sized by them. With the fog off the game leaves out all but the
+        // Fog event's thick one as it draws: "fog off" in mapinfo.txt, src/runtime/maps.cpp.)
         // the minimap: the map from above, in the HUD (its files beside the stage's), and the stage's scale for it
         var regions = spec.Areas.Where(a => a.Minimap).Select(a =>
         {
@@ -258,11 +261,27 @@ public static class MapBuilder
         // filtered smoothly (as the N64 did), not nearest
         foreach (var jt in jobj.TreeList)
             for (var d = jt.Dobj; d != null; d = d.Next)
+            {
                 for (var t = d.Mobj?.Textures; t != null; t = t.Next)
                 {
                     t.MagFilter = GXTexFilter.GX_LINEAR;
                     t.LOD = new HSD_TOBJ_LOD { MinFilter = GXTexFilter.GX_LINEAR, Bias = 0 };
                 }
+                // vertex colours as the city's own meshes take them: VERTEX alone, the alpha theirs too (the importer's
+                // BOTH - vertex and material - the game draws with the material's alone: trees' leaves, paths came out white)
+                if (d.Mobj != null && (d.Mobj.RenderFlags & RENDER_MODE.BOTH) == RENDER_MODE.BOTH)
+                    d.Mobj.RenderFlags = (d.Mobj.RenderFlags & ~(RENDER_MODE.CONSTANT | RENDER_MODE.ALPHA_BOTH)) | RENDER_MODE.ALPHA_VTX;
+                // See-through (a texture with alpha: leaves, fences): cut out, as the N64 drew them (its alpha compare) -
+                // drawn solid where the texture is, left out where it is clear. (The stage's see-through pass drew trees'
+                // leaves white, blended or not.)
+                if (d.Mobj != null && (d.Mobj.RenderFlags & RENDER_MODE.XLU) != 0)
+                {
+                    d.Mobj.RenderFlags &= ~RENDER_MODE.XLU;
+                    d.Mobj.PEDesc = new HSD_PEDesc { Flags = PIXEL_PROCESS_ENABLE.COLOR_UPDATE | PIXEL_PROCESS_ENABLE.COMPARE | PIXEL_PROCESS_ENABLE.ZUPDATE, AlphaRef0 = 100, DestinationAlpha = 0xFF,
+                        BlendMode = GXBlendMode.GX_NONE, SrcFactor = GXBlendFactor.GX_BL_ONE, DstFactor = GXBlendFactor.GX_BL_ZERO, BlendOp = GXLogicOp.GX_LO_NOOP,
+                        DepthFunction = GXCompareType.LEqual, AlphaComp0 = GXCompareType.Greater, AlphaOp = GXAlphaOp.And, AlphaComp1 = GXCompareType.Always };
+                }
+            }
         var modelFile = new HSDRawFile(Path.Combine(baseDir, "GrCity1Model.dat"));
         var gm = (KAR_grModel)modelFile.Roots.First(r => r.Data is KAR_grModel).Data;
         var mm = gm.MainModel;
@@ -302,6 +321,38 @@ public static class MapBuilder
         while (last.Next != null) last = last.Next;
         last.Next = jobj;
         }
+        // The sky: with parts (places far apart), one round each part - the city's sky, its pictures the map's, centred on the
+        // part and big enough to stand round it - drawn with the part. (One sky round them all would stand past what the
+        // camera draws.) Without parts: the city's, grown round the map.
+        Sky(gm, spec, min, max, log);
+        var partSkies = new Dictionary<HSD_JOBJ, int>();  // (each part's sky: its joint -> the part's number in regions)
+        if (regions.Count > 1 && gm.SkyboxModel?.JOBJRoot is { } skyRoot && !spec.ModelOnly)
+        {
+            for (int ri = 0; ri < regions.Count; ri++)
+            {
+                var (_, lo, hi) = regions[ri];
+                var mid = (lo + hi) / 2;
+                // (the city's: 2800 from its middle, 1211 to its cap: never smaller, and tall enough for the part's
+                // heights; src/runtime/maps.cpp has the camera see as far as across it - the same sizes, from mapinfo.txt)
+                float radius = Math.Max(2800f, new Vector2(hi.X - lo.X, hi.Z - lo.Z).Length() / 2 * 1.15f);
+                var s = HSDAccessor.DeepClone<HSD_JOBJ>(skyRoot);
+                s.Next = null;
+                s.TX = mid.X; s.TY = lo.Y - 200; s.TZ = mid.Z;
+                s.SX = s.SZ = radius / 2800f;
+                s.SY = Math.Max(s.SX, (hi.Y - lo.Y + 1500) / 1211f);
+                // (the sky's own model is drawn first, with no depth test; with the map's meshes, after them: tested, so
+                // anything nearer stays in front - it never writes depth, being the farthest)
+                foreach (var sj in s.TreeList)
+                    for (var d = sj.Dobj; d != null; d = d.Next)
+                        if (d.Mobj?.PEDesc is { } pe) { pe.Flags |= PIXEL_PROCESS_ENABLE.COMPARE; pe.Flags &= ~PIXEL_PROCESS_ENABLE.ZUPDATE; pe.DepthFunction = GXCompareType.LEqual; }
+                var lastChild = city.Child;
+                if (lastChild == null) city.Child = s;
+                else { while (lastChild.Next != null) lastChild = lastChild.Next; lastChild.Next = s; }
+                partSkies[s] = ri;
+            }
+            skyRoot.SX = skyRoot.SY = skyRoot.SZ = 0.001f;  // (the city's own sky, at the middle of the stage: out of sight)
+            log($"sky: one round each of the {regions.Count} parts");
+        }
         int joints = 0, dobjs = 0, pobjs = 0;
         foreach (var j in city.TreeList)
         {
@@ -321,11 +372,20 @@ public static class MapBuilder
         bool IsMap(int i) => mapCount > 0 ? i >= mapFirst && i < mapFirst + mapCount : i >= cityMeshes;
         var all = new List<HSD_DOBJ>();
         foreach (var j in city.TreeList) for (var d = j.Dobj; d != null; d = d.Next) all.Add(d);
+        var skyPart = new Dictionary<HSDStruct, int>();  // (a part's sky's meshes -> the part)
+        foreach (var (sj, ri) in partSkies) foreach (var j in sj.TreeList) for (var d = j.Dobj; d != null; d = d.Next) skyPart[d._s] = ri;
+        int SkyOf(int i) => skyPart.TryGetValue(all[i]._s, out int ri) ? ri : -1;
         var hidden = new KAR_grStaticBoundingBox { MinX = -1, MinY = -9001, MinZ = -1, MaxX = 1, MaxY = -9000, MaxZ = 1 };
         var boxes = new KAR_grStaticBoundingBox[dobjs];
         var mids = new Vector3[dobjs];
         for (int i = 0; i < dobjs; i++)
         {
+            if (SkyOf(i) is int sri and >= 0)
+            {
+                var (_, slo, shi) = regions[sri];
+                boxes[i] = new KAR_grStaticBoundingBox { MinX = slo.X, MinY = slo.Y, MinZ = slo.Z, MaxX = shi.X, MaxY = shi.Y, MaxZ = shi.Z };
+                continue;
+            }
             if (!IsMap(i)) { boxes[i] = hidden; continue; }
             var lo = new Vector3(float.MaxValue); var hi = new Vector3(float.MinValue);
             for (var p = all[i].Pobj; p != null; p = p.Next)
@@ -336,14 +396,15 @@ public static class MapBuilder
         }
         b.StaticBoundingBoxes = boxes;
         b.DynamicBoundingBoxes = Array.Empty<KAR_grDynamicBoundingBoxes>();
-        var mapIdx = Enumerable.Range(0, dobjs).Where(IsMap).ToList();
+        var mapIdx = Enumerable.Range(0, dobjs).Where(i => IsMap(i) && SkyOf(i) < 0).ToList();
         if (regions.Count > 1)
         {
             bool In((string name, Vector3 lo, Vector3 hi) r, Vector3 p) => p.X >= r.lo.X && p.X <= r.hi.X && p.Z >= r.lo.Z && p.Z <= r.hi.Z;
             var vr = new List<KAR_grViewRegion>();
-            foreach (var r in regions)
+            for (int ri = 0; ri < regions.Count; ri++)
             {
-                var idx = mapIdx.Where(i => In(r, mids[i])).Select(i => (ushort)i).ToArray();
+                var r = regions[ri];
+                var idx = mapIdx.Where(i => In(r, mids[i])).Concat(Enumerable.Range(0, dobjs).Where(i => SkyOf(i) == ri)).Select(i => (ushort)i).ToArray();
                 log($"  part {r.name}: {idx.Length} meshes, x {r.lo.X:F0}..{r.hi.X:F0} z {r.lo.Z:F0}..{r.hi.Z:F0}");
                 if (idx.Length == 0) continue;
                 // (where the camera can be while in it: the part's box, roomy)
@@ -360,7 +421,6 @@ public static class MapBuilder
             b.Indices = mapIdx.Select(i => (ushort)i).ToArray();  // (the meshes drawn: the map's)
         }
         // (the city's animations move the city's joints, which draw nothing: they stay)
-        Sky(gm, spec, min, max, log);
         modelFile.Save(Path.Combine(outDir, "GrCity1Model.dat"));
         log($"model: {joints} joints, {dobjs} meshes, {pobjs} polygon groups");
     }
@@ -564,11 +624,33 @@ public static class MapBuilder
             }
             lists.Array = arr;
         }
+        // The game checks every start position has floor under it (grnullpos.c: "startpos error", then it stops): each one
+        // put a little above the floor below it - the highest floor not far above it - else (a spawn under the ground: a
+        // tree's foot) on the nearest floor above it, or, with none there, back on its spawn.
+        Vector3? Floor(Vector3 p)
+        {
+            float best = float.MinValue, above = float.MaxValue;
+            foreach (var t in floors)
+            {
+                float den = (t.B.Z - t.C.Z) * (t.A.X - t.C.X) + (t.C.X - t.B.X) * (t.A.Z - t.C.Z);
+                if (MathF.Abs(den) < 1e-6f) continue;
+                float w0 = ((t.B.Z - t.C.Z) * (p.X - t.C.X) + (t.C.X - t.B.X) * (p.Z - t.C.Z)) / den;
+                float w1 = ((t.C.Z - t.A.Z) * (p.X - t.C.X) + (t.A.X - t.C.X) * (p.Z - t.C.Z)) / den;
+                if (w0 < 0 || w1 < 0 || w0 + w1 > 1) continue;
+                float y = w0 * t.A.Y + w1 * t.B.Y + (1 - w0 - w1) * t.C.Y;
+                if (y <= p.Y + 60) { if (y > best && y > p.Y - 1300) best = y; }
+                else if (y < above) above = y;
+            }
+            if (best == float.MinValue) best = above;
+            return best == float.MaxValue ? null : new Vector3(p.X, best + 10, p.Z);
+        }
+        spawns = spawns.Select(sp => (Floor(sp.Item1) ?? sp.Item1, sp.Item2)).ToList();
         Fill(pn.Startpos, (li, i) =>
         {
             var (p, yaw) = spawns[i % spawns.Count];
             float ring = i / spawns.Count * 6f, ang = i * 2.4f;  // (riders past the spawns placed: around them)
-            return At(p + new Vector3(MathF.Cos(ang) * ring, 0, MathF.Sin(ang) * ring), yaw);
+            var q = p + new Vector3(MathF.Cos(ang) * ring, 0, MathF.Sin(ang) * ring);
+            return At(Floor(q) ?? p, yaw);
         });
         Fill(pn.GlobalDeadPos, (li, i) => At(spawns[0].Item1, spawns[0].Item2));
         Fill(pn.Enemypos, (li, i) => At(OnFloor(10)));

@@ -46,3 +46,26 @@ if (Test-Path $zip) { Remove-Item -Force $zip }
 & (Join-Path $env:SystemRoot 'System32\tar.exe') -a -c -f $zip -C $dist KirbyAirRideRecompiled
 if ($LASTEXITCODE) { throw 'tar failed' }
 Get-Item $zip | ForEach-Object { "{0} ({1:N0} MB)" -f $_.FullName, ($_.Length / 1MB) }
+
+# The map editor, a download of its own (it runs without .NET installed: 185 MB): MapEditor\, unzipped into the game's
+# folder it finds the game beside it (tools/mapeditor).
+$ed = Join-Path $dist 'MapEditor'
+if (Test-Path $ed) { Remove-Item -Recurse -Force $ed }
+& dotnet publish (Join-Path $root 'tools\mapeditor\KarMapEditor') -c Release -r win-x64 --self-contained true -o $ed | Out-Null
+if ($LASTEXITCODE) { throw 'the map editor did not build' }
+$edZip = Join-Path $dist "KarMapEditor-$Version-windows-x64.zip"
+if (Test-Path $edZip) { Remove-Item -Force $edZip }
+& (Join-Path $env:SystemRoot 'System32\tar.exe') -a -c -f $edZip -C $dist MapEditor
+if ($LASTEXITCODE) { throw 'tar failed' }
+Get-Item $edZip | ForEach-Object { "{0} ({1:N0} MB)" -f $_.FullName, ($_.Length / 1MB) }
+
+# The Hyrule Field map (maps\HyruleField): a download of its own, unzipped into the game's folder (mods\maps\HyruleField)
+$mapStage = Join-Path $dist 'map'
+if (Test-Path $mapStage) { Remove-Item -Recurse -Force $mapStage }
+New-Item -ItemType Directory -Force (Join-Path $mapStage 'mods\maps') | Out-Null
+Copy-Item -Recurse (Join-Path $root 'maps\HyruleField') (Join-Path $mapStage 'mods\maps\HyruleField')
+$mapZip = Join-Path $dist "HyruleField-$Version.zip"
+if (Test-Path $mapZip) { Remove-Item -Force $mapZip }
+& (Join-Path $env:SystemRoot 'System32\tar.exe') -a -c -f $mapZip -C $mapStage mods
+if ($LASTEXITCODE) { throw 'tar failed' }
+Get-Item $mapZip | ForEach-Object { "{0} ({1:N0} MB)" -f $_.FullName, ($_.Length / 1MB) }

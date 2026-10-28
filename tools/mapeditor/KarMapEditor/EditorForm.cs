@@ -1,7 +1,7 @@
 // The editor's window, laid out as level editors are (Hammer): tools down the left, the 3D view and the view from above
 // in the middle, the objects, the map's settings, its music and its minimaps on the right, the builder's messages below.
-//   File: a new map from a model (any of .gltf .glb .obj .fbx .dae .smd, or a scene of Ocarina of Time from Ship of
-//         Harkinian), open, save. Map: build it as a mod (its collision, minimaps and music made then), play it.
+//   File: a new map from a model (any of .gltf .glb .obj .fbx .dae .smd), open, save. Map: build it as a mod (its
+//         collision, minimaps and music made then), play it.
 //   Tools: Select / Move / Rotate / Scale (Q W E R), then what can be placed: Spawn, Area, Warp, Event point (1-4).
 using System.Diagnostics;
 using System.Text.Json;
@@ -210,7 +210,6 @@ public class EditorForm : Form
         file.DropDownItems.AddRange(new ToolStripItem[]
         {
             Item("&New map from a model...", Theme.GNew, NewFromModel, Keys.Control | Keys.N),
-            Item("New map from &Ocarina of Time (Ship of Harkinian)...", Theme.GImport, ImportSoh),
             Item("&Open map...", Theme.GOpen, OpenDialog, Keys.Control | Keys.O),
             new ToolStripSeparator(),
             Item("&Save", Theme.GSave, () => Save(), Keys.Control | Keys.S),
@@ -387,35 +386,6 @@ public class EditorForm : Form
         _mapProps.SelectedObject = new MapSettings(spec);
         _doc.TouchStructure();
         UpdateTitle();
-    }
-
-    // a scene of Ocarina of Time (from Ship of Harkinian's oot.o2r) as a map, with the places its exits lead to
-    void ImportSoh()
-    {
-        if (!ConfirmDiscard()) return;
-        using var f = new Form { Text = "Ocarina of Time scene", Width = 520, Height = 230, FormBorderStyle = FormBorderStyle.FixedDialog, StartPosition = FormStartPosition.CenterParent, MaximizeBox = false, MinimizeBox = false };
-        var o2r = new TextBox { Left = 120, Top = 16, Width = 300, Text = _settings.SohArchive ?? "" };
-        var browse = new Button { Left = 426, Top = 14, Width = 70, Text = "Browse" };
-        var scene = new ComboBox { Left = 120, Top = 52, Width = 200, DropDownStyle = ComboBoxStyle.DropDown, Text = "spot00" };
-        scene.Items.AddRange(new object[] { "spot00 (Hyrule Field)", "spot01 (Kakariko)", "spot04 (Kokiri Forest)", "spot09 (Gerudo Valley)", "spot15 (Hyrule Castle)", "spot20 (Lon Lon Ranch)" });
-        var alone = new CheckBox { Left = 120, Top = 88, Width = 360, Text = "This scene alone (else with the places its exits lead to)" };
-        var ok = new Button { Left = 316, Top = 140, Width = 86, Text = "Import", DialogResult = DialogResult.OK };
-        var cancel = new Button { Left = 410, Top = 140, Width = 86, Text = "Cancel", DialogResult = DialogResult.Cancel };
-        f.Controls.AddRange(new Control[] { new Label { Left = 12, Top = 19, Width = 100, Text = "oot.o2r" }, o2r, browse, new Label { Left = 12, Top = 55, Width = 100, Text = "Scene" }, scene, alone, ok, cancel });
-        browse.Click += (_, _) => { using var d = new OpenFileDialog { Filter = "Ship of Harkinian archive|*.o2r|All files|*.*" }; if (d.ShowDialog(f) == DialogResult.OK) o2r.Text = d.FileName; };
-        f.AcceptButton = ok; f.CancelButton = cancel;
-        f.BackColor = Theme.Surface; Theme.Apply(f);
-        if (f.ShowDialog(this) != DialogResult.OK || !File.Exists(o2r.Text)) return;
-        _settings.SohArchive = o2r.Text; _settings.Save();
-        var name = scene.Text.Split(' ')[0];
-        using var save = new FolderBrowserDialog { Description = "Where the map goes (a folder of its own)", UseDescriptionForTitle = true };
-        if (save.ShowDialog(this) != DialogResult.OK) return;
-        var outDir = save.SelectedPath;
-        RunBusy($"importing {name}", () =>
-        {
-            if (alone.Checked) SohScene.Import(o2r.Text, name, outDir, 0.25f, s => BeginInvoke(() => Log(s)));
-            else SohWorld.Import(o2r.Text, name, outDir, 0.25f, s => BeginInvoke(() => Log(s)));
-        }, () => { var mj = Path.Combine(outDir, "map.json"); if (File.Exists(mj)) Open(mj); });
     }
 
     void ReloadModel()
@@ -638,7 +608,7 @@ public class EditorForm : Form
     {
         if (_doc.Spec == null || _building) return;
         if (!Save()) return;
-        if (!File.Exists(Path.Combine(_settings.CityDir ?? "", "GrCity1.dat")) && !AskCityDir()) return;
+        if (!File.Exists(Path.Combine(_settings.CityDir ?? "", "GrCity1.dat")) && !ExtractCityFiles() && !AskCityDir()) return;
         if (play && !File.Exists(_settings.GameExe ?? "") && !AskGame()) return;
         string outDir = ModDir, specPath = _doc.Path, cityDir = _settings.CityDir;
         _status.Text = "Building: the collision, the minimaps and the music are made now...";
@@ -663,6 +633,32 @@ public class EditorForm : Form
         File.WriteAllLines(ini, lines);
         Process.Start(new ProcessStartInfo(_settings.GameExe) { UseShellExecute = false, WorkingDirectory = dir });
         Log($"the game started, Stage: {_doc.Spec.Name} (City Trial > Game Settings changes it)");
+    }
+
+    // the city's files from the player's disc, by the game itself (kirbyairride.exe --extract: any image it reads)
+    static readonly string[] CityFiles = { "GrCity1.dat", "GrCity1Model.dat", "GrCity1Event.dat", "IfAll1c.dat", "IfAll1cs.dat" };
+    bool ExtractCityFiles()
+    {
+        if (!File.Exists(_settings.GameExe ?? "") && !AskGame()) return false;
+        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "KarMapEditor", "disc");
+        var psi = new ProcessStartInfo(_settings.GameExe) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true, WorkingDirectory = Path.GetDirectoryName(_settings.GameExe) };
+        psi.ArgumentList.Add("--extract"); psi.ArgumentList.Add(dir);
+        foreach (var f in CityFiles) psi.ArgumentList.Add(f);
+        try
+        {
+            using var p = Process.Start(psi);
+            var err = p.StandardError.ReadToEnd();
+            p.WaitForExit(60000);
+            if (p.ExitCode != 0 || !File.Exists(Path.Combine(dir, "GrCity1.dat")))
+            {
+                MessageBox.Show(this, "The game couldn't read its files from the disc (start the game once and choose the disc first).\n\n" + err, Text);
+                return false;
+            }
+        }
+        catch (Exception e) { MessageBox.Show(this, e.Message, Text); return false; }
+        _settings.CityDir = dir; _settings.Save();
+        Log($"the city's files: read from the disc into {dir}");
+        return true;
     }
 
     bool AskCityDir()
@@ -691,7 +687,6 @@ public class Settings
     public string CityDir { get; set; }
     public string GameExe { get; set; }
     public string LastMap { get; set; }
-    public string SohArchive { get; set; }
 
     static string FilePath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "KarMapEditor", "settings.json");
 
@@ -700,6 +695,10 @@ public class Settings
         Settings s = null;
         try { if (File.Exists(FilePath)) s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)); } catch { }
         s ??= new Settings();
+        // the game beside the editor (the release has the editor in its MapEditor folder)
+        if (s.GameExe == null || !File.Exists(s.GameExe))
+            foreach (var g in new[] { Path.Combine(AppContext.BaseDirectory, "..", "kirbyairride.exe"), Path.Combine(AppContext.BaseDirectory, "kirbyairride.exe") })
+                if (File.Exists(g)) { s.GameExe = Path.GetFullPath(g); break; }
         if (s.CityDir == null)
         {
             // the source tree's extracted disc, when the editor runs from it
