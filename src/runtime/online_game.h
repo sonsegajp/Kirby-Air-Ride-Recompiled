@@ -31,6 +31,8 @@ struct Start {
     uint32_t seed = 0;
     int64_t startAtMs = 0;  // (airnet's clock)
     std::string settingsJson;
+    std::vector<int> colours;  // each console's Kirby colour, by console: the game's number (Pink 0, Yellow 1, Blue 2, Green 3,
+                               // White 4, Purple 5, Brown 6, Red 7); -1 or missing: the game's own
 };
 bool sessionAvailable();  // the game side can start matches (lansession is in)
 bool begin(const Start& start);  // false: it could not

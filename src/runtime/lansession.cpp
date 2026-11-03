@@ -370,6 +370,7 @@ struct Request {
     int consoles = 0, index = 0;  // the PCs (2-8: the game's consoles are the first 4 - src/runtime/lan.h)
     uint32_t id = 0;
     Settings settings;
+    std::vector<int> colours;  // each PC's Kirby colour (the game's number; -1: the game's own)
 } s_req;
 bool s_abortReq = false, s_abortToSelect = false, s_hideLanMenu = false;
 Status s_status;
@@ -500,13 +501,36 @@ void fourRiders(Ctx& c) {
     log("[lansession] offline: %d riders, as the game (slots 6-9 cleared)\n", riders);
 }
 bool ourMatch() { return (lan::sessionPcs() > 0 && s_phase == Phase::InMatch) || s_solo.inMatch; }
+// Each PC's rider in its player's own Kirby colour (their profile's, from the lobby): the game's LAN mode gives each
+// console's player a colour by its place, which the Online menu never shows - so a player's choice ended up on
+// whoever sat in its place. (Only the look: nothing the consoles must agree on.)
+// Where each PC's player is: the game's consoles (the first 4 PCs) have theirs in its slots 0-3 in console order, but
+// not one a slot - each console has room for its own players (2 consoles: slots 0-1 and 2-3, so the second console's
+// player is in slot 2); PCs past 4, their own slots (src/runtime/lan.h).
+void ownColours() {
+    if (s_phase != Phase::InMatch) return;
+    const int pcs = std::min(lan::sessionPcs() > 0 ? lan::sessionPcs() : s_cur.consoles, 8), consoles = std::min(pcs, 4);
+    int slot[8], humans = 0;
+    for (u32 s = 0; s < 4 && humans < consoles; s++)
+        if (rd8(morepl::plyDesc(s)) == 0) slot[humans++] = int(s);  // (0: a person; 1 a CPU, 4 no one)
+    for (int pc = 4; pc < pcs; pc++) slot[pc] = lan::riderOf(pc);
+    for (int pc = humans < consoles ? 4 : 0; pc < pcs && pc < int(s_cur.colours.size()); pc++) {  // (not all entered yet: the rest later)
+        const int colour = s_cur.colours[size_t(pc)];
+        const u32 d = morepl::plyDesc(u32(slot[pc]));
+        if (colour < 0 || colour > 7 || rd8(d) == 4) continue;  // (the game's own; no one there)
+        if (rd8(d + 4) != u32(colour)) log("[lansession] PC %d's rider (slot %d): colour %u -> %d\n", pc, slot[pc], rd8(d + 4), colour);
+        wr8(d + 4, u32(colour));
+    }
+}
 constexpr u32 kArSetup = 0x80020638;  // the other setup that counts the riders (Air Ride's, from 80026F20 / 80027FA4)
 void arSetup(Ctx& c, u32 entry) {
     interpOriginal(c, entry);
     if (morepl::active() && !ourMatch()) fourRiders(c);
+    ownColours();
 }
 void ctSetup(Ctx& c, u32 entry) {
     interpOriginal(c, entry);
+    ownColours();
     if (morepl::active() && !ourMatch()) return fourRiders(c);
     if (s_trace) {  // (SA2_LAN_SESSION_TRACE: the players the game entered, and their views)
         for (u32 slot = 0; slot < morepl::count(morepl::k_ply_desc); slot++) {
@@ -539,6 +563,7 @@ void ctSetup(Ctx& c, u32 entry) {
             wr8(v + 1, pc == me ? 1 : 0);
             wr8(v + 2, 0xFF);
         }
+        ownColours();  // (over the colours chosen above: each player's own)
         int riders = 0;
         for (int i = 0; i < morepl::riders(); i++) riders += rd8(morepl::plyDesc(morepl::riderSlot(i))) != 4 ? 1 : 0;
         guestCall(c, kSetRiderCount, {u32(riders)});
@@ -721,6 +746,7 @@ void lanMenuFrame(Ctx& c, u32 entry) {
     if (s_phase != Phase::Connecting && s_phase != Phase::Leaving && takeRequest(r)) {
         if (connected && s_phase == Phase::Parked && r.consoles == s_cur.consoles && r.index == s_cur.index) {
             s_cur.settings = r.settings;  // a rematch: shown on this console's pad until everyone shows it
+            s_cur.colours = r.colours;
             s_rematchSign = true;
             log("[lansession] rematch asked (settings %08X): signing\n", hash(r.settings));
         } else if (connected) {
@@ -871,6 +897,9 @@ void sceneStart(Ctx& c, u32 entry) {
     s_sceneSerial++;
     if (s_trace) log("[lansession] scene: mode %u scene %u\n", rd8(kGmMode), rd8(kGmMajor));
     if (s_phase == Phase::InMatch && rd8(kGmMajor) == 0x12) s_matchStarted = true;
+    // (the race, the city, a Stadium event: its riders made from the players' entries - by now everyone's, the other
+    // consoles' players joined during Player Entry, after its setup: their colours too)
+    if (rd8(kGmMajor) == 0x12) ownColours();
     interpOriginal(c, entry);
 }
 
@@ -1115,7 +1144,7 @@ Status status() {
     return s_status;
 }
 
-bool begin(int n, int index, const Settings& settings, uint32_t id) {
+bool begin(int n, int index, const Settings& settings, uint32_t id, const std::vector<int>& colours) {
     if (n < 2 || n > (morepl::active() ? 8 : 4) || index < 0 || index >= n) return false;
     if (n > 4 && settings.game != Game::CityTrial) return false;  // (Air Ride: 4 riders still)
     std::lock_guard g(s_lock);
@@ -1124,6 +1153,7 @@ bool begin(int n, int index, const Settings& settings, uint32_t id) {
     s_req.consoles = n;
     s_req.index = index;
     s_req.settings = settings;
+    s_req.colours = colours;
     s_req.id = id ? id : hash(settings) ^ u32(n) * 0x9E3779B9u;
     s_abortReq = false;
     if (s_status.phase == Phase::Idle || s_status.phase == Phase::Failed) {

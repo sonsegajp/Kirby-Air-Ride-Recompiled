@@ -909,7 +909,17 @@ void beginMatch() {
     st.seed = m.seed;
     st.startAtMs = m.startAtMs;
     st.settingsJson = m.settingsJson;
-    log("[onlinemenu] match %u: console %d of %d\n", m.id, st.me, st.consoles);
+    // each console's Kirby in its player's colour (their profile's, as the lobby lists them)
+    st.colours.assign(m.consoles.size(), -1);
+    for (const an::MatchStart::Console& con : m.consoles)
+        if (const an::Member* who = member(con.name); who && con.console >= 0 && size_t(con.console) < st.colours.size() && !who->colour.empty())
+            st.colours[size_t(con.console)] = kirbyFrame(who->colour);
+    std::string cl;
+    for (const an::MatchStart::Console& con : m.consoles) {
+        const an::Member* who = member(con.name);
+        cl += " " + con.name + "=" + (who ? who->colour : std::string("?"));
+    }
+    log("[onlinemenu] match %u: console %d of %d (colours:%s)\n", m.id, st.me, st.consoles, cl.c_str());
     if (!game::begin(st)) {
         g.matchFailed = true;
         toast("Online matches cannot start in this build yet.");
@@ -2387,6 +2397,15 @@ void runTest(int frame) {
             g_shotAt = frame;  // (written once this frame is drawn)
         } else if (w == "join") {  // (to the server list, then into the first server listed - until in its lobby)
             g_testJoin = true;
+        } else if (w.rfind("host=", 0) == 0) {  // (host=airride|citytrial: a server of that mode that starts by itself)
+            an::HostOptions o;
+            const int mode = w.substr(5) == "citytrial" ? game::kCityTrial : game::kAirRide;
+            o.name = "Test";
+            o.maxMembers = 8, o.maxPlayers = mode == game::kCityTrial ? 8 : 4;
+            o.mode = mode == game::kAirRide ? an::Mode::AirRide : an::Mode::CityTrial;
+            o.autoStart = true;
+            o.settingsJson = game::Settings::defaults(mode).toJson();
+            net().host(o);
         }
     }
     if (g_testJoin) {

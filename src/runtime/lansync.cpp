@@ -105,10 +105,14 @@ constexpr u16 kEtherType = 0x88B5;  // IEEE "local experimental"
 constexpr u32 kMagic = 0x4B415273;  // "KARs"
 constexpr u8 kVersion = 4;
 constexpr int kMaxPeers = 8, kHistory = 512, kMaxEntries = 15, kRedundancy = 4;
-// Our rounds made but not yet queued for our game, at most: a PC whose game takes no sets (a loading screen) stops
-// making rounds there - the others wait for it - so no PC's rounds run more than ~2 x this past another's queue
-// (kHistory: the rounds kept, past that they are overwritten).
-constexpr int kMaxAhead = 90;
+// Our rounds made but not yet queued for our game, at most: the input delay (D, below) and a few more. A round made
+// is this PC's input, run when the game gets to it - every round made past D is a frame more before a press is seen.
+// So where the game takes its sets slower than the retraces come (a PC that can't keep 60 in City Trial's city; a
+// loading screen, none), this PC makes its rounds at that pace and the others wait for them - everyone plays at the
+// slowest one's pace, with the input delay as set, not seconds of it. (It was 90 rounds: City Trial at 30 steps a
+// second made 90 rounds ahead - three seconds before a press did anything; players reported just that.) Past
+// kHistory rounds kept, they are overwritten.
+constexpr int kAheadSpare = 2;
 constexpr int kGameSlots = 4;  // the consoles the game's token has room for (PCs 4-7 ride on their spare ports)
 constexpr int kHeader = 14 + 24 + kMaxPeers * 10 + 1, kEntry = 4 + 4 + kSlotSize;
 enum : u8 { kData = 1, kEnd = 2 };
@@ -435,7 +439,7 @@ void ringThread(Ctx& c, u32) {
         // One round made per retrace, whatever happens to this thread: a turn that missed retraces (the
         // host busy) makes the rounds it owes first, so the others never wait for us.
         for (int owed = std::min<int>(s32(rd32(kRetraceCount) - retraceBase) - made - 1, 3); owed > 0; owed--) {
-            if (made >= queued + kMaxAhead) {  // (our game is not taking its sets - a loading screen: it owes none)
+            if (made >= queued + D + kAheadSpare) {  // (our game is not taking its sets as fast: it owes none)
                 retraceBase = rd32(kRetraceCount) - u32(made) - 1;
                 break;
             }
@@ -554,8 +558,8 @@ void ringThread(Ctx& c, u32) {
             }
         }
         if (ended) break;
-        if (done == 0) {  // nothing queued: still make our round, on time (not past kMaxAhead: below)
-            if (made < queued + kMaxAhead) makeOnly();
+        if (done == 0) {  // nothing queued: still make our round, on time (not past the input delay and a few: above)
+            if (made < queued + D + kAheadSpare) makeOnly();
             else retraceBase++;
         } else if (done == 2) {
             total.doubled++, last.doubled++;
@@ -604,9 +608,9 @@ void ringThread(Ctx& c, u32) {
                 char b[48];
                 for (int j = 0; j < n; j++)
                     if (j != me) std::snprintf(b, sizeof b, " %.0f/d%d", s_peers[j].slack, s_peers[j].delay), others += b;
-                log("[lansync] round %d, delay %d: last %llu turns %llu late (%.0f ms), %llu skipped, %llu doubled, %llu made late; slack p2/p50 %.0f/%.0f ms "
-                    "(others%s); round trips p50/p95%s\n",
-                    queued, D - 1, (unsigned long long)last.turns, (unsigned long long)last.late, last.lateMs, (unsigned long long)last.skipped,
+                log("[lansync] round %d (%d made, not yet run), delay %d: last %llu turns %llu late (%.0f ms), %llu skipped, %llu doubled, %llu made late; "
+                    "slack p2/p50 %.0f/%.0f ms (others%s); round trips p50/p95%s\n",
+                    queued, made - queued, D - 1, (unsigned long long)last.turns, (unsigned long long)last.late, last.lateMs, (unsigned long long)last.skipped,
                     (unsigned long long)last.doubled, (unsigned long long)last.caughtUp, pct(2), pct(50), others.c_str(), rttText().c_str());
                 last = Stats{}, logSlack.clear();
             }

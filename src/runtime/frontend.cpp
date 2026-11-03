@@ -678,7 +678,15 @@ int runFrontend(int argc, char** argv, bool headless, u64 maxFrames, void (*star
                 continue;
             }
         } else if (!interp) {
-            if (!newFrame) continue;
+            // No new game frame: the game loading, or parked between online matches (src/runtime/lansession.cpp: in step,
+            // drawing nothing) - its last frame again now and then, so the window, the F1 menu and the Online menu stay
+            // alive (the Online menu's own steps run as it is drawn: parked, without this, it never came back - the
+            // match over, the next one never begun - and the window froze). Every refresh while a menu is open; a few
+            // times a second otherwise.
+            static double s_drawnAt = 0;
+            const double gap = online::isOpen() || menu::isOpen() ? 1.0 / 75 : 0.1;
+            if (!newFrame && gxNow() - s_drawnAt < gap) continue;
+            s_drawnAt = gxNow();
             when = 1e300;
         } else {
             // Even pacing: one in-between frame every k refreshes. Each is drawn for its own slot in that steady schedule,

@@ -18,6 +18,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace rt::lansession {
 
@@ -124,8 +125,10 @@ Status status();
 // it leaves the old session and connects anew). Returns false (nothing changes) if the arguments are invalid or a
 // session is connecting/in a match.
 // consoles: the PCs, 2-4 (2-8 in the 8-player build: the game sees 4 consoles, PCs 4-7 on their spare ports -
-// src/runtime/lan.h); id: the same on all of them, different for each session (the match's seed).
-bool begin(int consoles, int myIndex, const Settings& settings, uint32_t id = 0);
+// src/runtime/lan.h); id: the same on all of them, different for each session (the match's seed). colours: each PC's
+// Kirby, by PC - the game's colour number (Pink 0, Yellow 1, Blue 2, Green 3, White 4, Purple 5, Brown 6, Red 7), -1 or
+// missing: the game's own (only how the riders look: not part of what the consoles must agree on).
+bool begin(int consoles, int myIndex, const Settings& settings, uint32_t id = 0, const std::vector<int>& colours = {});
 // Leaves (connecting: cancels; in a match or parked: disconnects - the others' sessions fail). The game ends in
 // its Online mode, hidden while the Online menu covers it; `toSelectMode`: back to Select Mode instead.
 void abort(bool toSelectMode = false);
